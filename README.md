@@ -1,7 +1,4 @@
 # frcobot_ros2
-This is the ROS2 API project of Fairino robot(sofeware version must greater than V3.7.1), a serial of functions which based on Fair SDK API but were simplified are created, user can call them through service message.
-API_description.md list all API functions.
-Tutorial of installing and uasage of ROS2 API, please refer to the Fair document platform:https://fair-documentation.readthedocs.io/en/latest/ROSGuide/index.html#frcobot-ros2.
-
-Version histroy:
-2023.7.18 V1.0
+该项目为法奥机器人ROS2 API接口，基于法奥SDK库，简化了参数并提供了service接口，用户可以发送字符串指令到接口实现对应的功能。
+API函数的介绍见API说明.md文件
+安装教程及说明可以参考法奥文档平台的内容: https://fr-documentation.readthedocs.io/zh_CN/latest/ROSGuide/ros2guide.html
