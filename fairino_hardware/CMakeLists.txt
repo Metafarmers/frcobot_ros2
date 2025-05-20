@@ -16,30 +16,35 @@ find_package(fairino_msgs REQUIRED)
 
 set(CMAKE_CXX_STANDARD 17)
 
-set(SRC_DIR EXP_SRC_DIR)
+# 소스 파일 설정
 file(GLOB SRC_DIR ./src/command_server.cpp ./src/command_server_node.cpp)
 file(GLOB EXP_SRC_DIR ./examples/src/*.cpp)
+file(GLOB XMLRPC_SRC ${CMAKE_CURRENT_SOURCE_DIR}/include/xmlrpc/*.cpp)
 
-#compile
+# 실행 파일
 add_executable(ros2_cmd_server ${SRC_DIR})
 add_executable(srv_test_client ${EXP_SRC_DIR})
-add_library(
-  fairino_hardware 
-  SHARED 
+
+# 라이브러리 정의 및 소스 연결
+add_library(fairino_hardware SHARED)
+target_sources(fairino_hardware PRIVATE
   ./src/fairino_robot.cpp 
   ./src/fairino_hardware_interface.cpp
+  ${XMLRPC_SRC}
 )
 
-#add headfile source
+# include 경로 설정
 target_include_directories(ros2_cmd_server PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include/)
 target_include_directories(srv_test_client PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/examples/include)
-target_include_directories(fairino_hardware PUBLIC 
-$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-$<INSTALL_INTERFACE:include/fairino_hardware>
-)
-target_link_libraries(fairino_hardware ${CMAKE_CURRENT_SOURCE_DIR}/include/xmlrpc/libXmlRpc.a)
 
-#add dependencies
+target_include_directories(fairino_hardware PUBLIC 
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include/xmlrpc>
+  $<INSTALL_INTERFACE:include/fairino_hardware>
+  $<INSTALL_INTERFACE:include/xmlrpc>
+)
+
+# ament dependencies
 ament_target_dependencies(ros2_cmd_server rclcpp fairino_msgs)
 ament_target_dependencies(srv_test_client rclcpp fairino_msgs)
 ament_target_dependencies(fairino_hardware 
@@ -50,44 +55,45 @@ ament_target_dependencies(fairino_hardware
   rclcpp_lifecycle 
 )
 
-
-#export hardware plugins
+# pluginlib export
 pluginlib_export_plugin_description_file(hardware_interface fairino_hardware.xml)
 
-#install all files
-#command server
+# 설치 설정
 install(TARGETS ros2_cmd_server
   DESTINATION lib/${PROJECT_NAME}
 )
 
-#test example
 install(TARGETS srv_test_client
   DESTINATION lib/${PROJECT_NAME}
 )
 
-#ros2_control hardware
 install(TARGETS fairino_hardware
   EXPORT fairino_hardware
   ARCHIVE DESTINATION lib/${PROJECT_NAME}
   LIBRARY DESTINATION lib/${PROJECT_NAME}
 )
 
+# include 디렉토리 설치
+install(DIRECTORY include/fairino_hardware
+  DESTINATION include
+)
 
+install(DIRECTORY include/xmlrpc
+  DESTINATION include
+)
+
+# 테스트 설정
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)
   find_package(ament_cmake_gmock REQUIRED)
   find_package(hardware_interface REQUIRED)
-  # the following line skips the linter which checks for copyrights
-  # comment the line when a copyright and license is added to all source files
-  set(ament_cmake_copyright_FOUND TRUE)
-  # the following line skips cpplint (only works in a git repo)
-  # comment the line when this package is in a git repo and when
-  # a copyright and license is added to all source files
+
   set(ament_cmake_cpplint_FOUND TRUE)
+  set(ament_cmake_copyright_FOUND TRUE)
   ament_lint_auto_find_test_dependencies()
 endif()
 
-#export
+# export 설정
 ament_export_targets(fairino_hardware HAS_LIBRARY_TARGET)
 ament_export_dependencies(ament_cmake rclcpp hardware_interface pluginlib rclcpp_lifecycle)
 
