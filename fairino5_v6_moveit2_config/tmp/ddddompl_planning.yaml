@@ -1,0 +1,28 @@
+planner_configs:
+  RRTConnect:
+    type: geometric::RRTConnect
+    range: 0.0  # 0.0 = auto
+
+  TRRT:
+    type: geometric::TRRT
+    range: 0.0
+    goal_bias: 0.05
+    max_states_failed: 10
+    temp_change_factor: 0.1
+    init_temperature: 10e-6
+    frontier_threshold: 0.0
+    frontier_node_ratio: 0.1
+    k_constant: 0.0
+
+ompl:
+  planning_plugin: ompl_interface/OMPLPlanner
+  request_adapters: >-
+    default_planner_request_adapters/FixWorkspaceBounds
+    default_planner_request_adapters/FixStartStateBounds
+    default_planner_request_adapters/FixStartStateInCollision
+  start_state_max_bounds_error: 0.1
+  default_planner_config: TRRT
+
+  planner_configs:
+    - RRTConnect
+    - TRRT

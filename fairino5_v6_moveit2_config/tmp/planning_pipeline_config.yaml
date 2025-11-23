@@ -1,0 +1,27 @@
+default_planning_pipeline: ompl
+
+planning_pipelines:
+  - ompl
+
+ompl:
+  planning_plugin: ompl_interface/OMPLPlanner
+  request_adapters: >-
+    default_planner_request_adapters/FixWorkspaceBounds
+    default_planner_request_adapters/FixStartStateBounds
+    default_planner_request_adapters/FixStartStateInCollision
+    default_planner_request_adapters/ResolveConstraintFrames
+    default_planner_request_adapters/ValidateStartState
+  start_state_max_bounds_error: 0.1
+  default_planner_config: TRRT
+
+  planner_configs:
+    TRRT:
+      type: geometric::TRRT
+      goal_bias: 0.05
+      max_states_failed: 10
+      temp_change_factor: 0.1
+      init_temperature: 10.0
+      frontier_threshold: 0.0
+      frontier_node_ratio: 0.1
+      k_constant: 10.0
+      range: 0.0

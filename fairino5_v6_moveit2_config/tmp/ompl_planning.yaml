@@ -1,0 +1,35 @@
+planner_configs:
+  RRTConnect: &RRTConnect
+    type: geometric::RRTConnect
+    range: 0.2
+
+  PRM: &PRM
+    type: geometric::PRM
+    range: 0.1
+
+  LBKPIECE: &LBKPIECE
+    type: geometric::LBKPIECE
+    range: 0.2
+
+  EST: &EST
+    type: geometric::EST
+    range: 0.3
+
+  SBL: &SBL
+    type: geometric::SBL
+    range: 0.2
+
+  # TRRT: &TRRT
+  #   type: geometric::TRRT
+  #   range: 0.2
+
+
+fairino5_v6_group:
+  default_planner_config: RRTConnect
+  planner_configs:
+    - RRTConnect
+    - LBKPIECE
+    - PRM
+    - EST
+    - SBL
+    # - TRRT
