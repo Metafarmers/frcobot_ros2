@@ -1,16 +1,12 @@
 Panels:
   - Class: rviz_common/Displays
-    Help Height: 0
+    Help Height: 70
     Name: Displays
     Property Tree Widget:
       Expanded:
-        - /MotionPlanning1
         - /TF1
-        - /TF1/Frames1
-        - /TF1/Tree1
-        - /PointCloud21
       Splitter Ratio: 0.5
-    Tree Height: 493
+    Tree Height: 70
   - Class: rviz_common/Help
     Name: Help
   - Class: rviz_common/Views
@@ -48,7 +44,7 @@ Visualization Manager:
       MoveIt_Allow_Replanning: false
       MoveIt_Allow_Sensor_Positioning: false
       MoveIt_Planning_Attempts: 10
-      MoveIt_Planning_Time: 10
+      MoveIt_Planning_Time: 5
       MoveIt_Use_Cartesian_Path: false
       MoveIt_Use_Constraint_Aware_IK: false
       MoveIt_Workspace:
@@ -75,11 +71,34 @@ Visualization Manager:
             Show Axes: false
             Show Trail: false
             Value: true
+          camera_frame:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+            Value: true
           forearm_link:
             Alpha: 1
             Show Axes: false
             Show Trail: false
             Value: true
+          mf_endeffector:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+            Value: true
+          mf_flange:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+          mf_manipulator_base_link:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+            Value: true
+          mf_tcp:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
           shoulder_link:
             Alpha: 1
             Show Axes: false
@@ -156,11 +175,34 @@ Visualization Manager:
             Show Axes: false
             Show Trail: false
             Value: true
+          camera_frame:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+            Value: true
           forearm_link:
             Alpha: 1
             Show Axes: false
             Show Trail: false
             Value: true
+          mf_endeffector:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+            Value: true
+          mf_flange:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+          mf_manipulator_base_link:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+            Value: true
+          mf_tcp:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
           shoulder_link:
             Alpha: 1
             Show Axes: false
@@ -193,270 +235,54 @@ Visualization Manager:
       Velocity_Scaling_Factor: 0.1
     - Class: rviz_default_plugins/TF
       Enabled: true
-      Frame Timeout: 30
+      Frame Timeout: 15
       Frames:
-        All Enabled: false
+        All Enabled: true
         base_link:
-          Value: false
-        camera_hand_aligned_depth_to_infra1_frame:
           Value: true
-        camera_hand_color_frame:
-          Value: false
-        camera_hand_color_optical_frame:
-          Value: false
-        camera_hand_depth_frame:
-          Value: false
-        camera_hand_depth_optical_frame:
-          Value: false
-        camera_hand_infra1_frame:
+        camera_frame:
           Value: true
-        camera_hand_infra1_optical_frame:
-          Value: true
-        camera_hand_link:
-          Value: false
-        endeffector:
-          Value: false
         forearm_link:
-          Value: false
-        gm_0:
           Value: true
-        gm_1:
+        mf_endeffector:
           Value: true
-        gm_10:
+        mf_flange:
           Value: true
-        gm_11:
+        mf_manipulator_base_link:
           Value: true
-        gm_12:
-          Value: true
-        gm_13:
-          Value: true
-        gm_14:
-          Value: true
-        gm_15:
-          Value: true
-        gm_16:
-          Value: true
-        gm_17:
-          Value: true
-        gm_18:
-          Value: true
-        gm_19:
-          Value: true
-        gm_2:
-          Value: true
-        gm_20:
-          Value: true
-        gm_21:
-          Value: true
-        gm_22:
-          Value: true
-        gm_23:
-          Value: true
-        gm_24:
-          Value: true
-        gm_25:
-          Value: true
-        gm_26:
-          Value: true
-        gm_27:
-          Value: true
-        gm_28:
-          Value: true
-        gm_29:
-          Value: true
-        gm_3:
-          Value: true
-        gm_30:
-          Value: true
-        gm_31:
-          Value: true
-        gm_32:
-          Value: true
-        gm_33:
-          Value: true
-        gm_34:
-          Value: true
-        gm_4:
-          Value: true
-        gm_5:
-          Value: true
-        gm_6:
-          Value: true
-        gm_7:
-          Value: true
-        gm_8:
-          Value: true
-        gm_9:
-          Value: true
-        gv_base_link:
-          Value: false
-        input_pose_mf_frame:
-          Value: true
-        lidar:
-          Value: false
-        lift_base_link:
-          Value: false
-        lift_end_link:
-          Value: false
-        manipulator_base_link:
-          Value: false
-        seedling_0:
+        mf_tcp:
           Value: true
         shoulder_link:
-          Value: false
-        target_pose_vendor_base:
-          Value: true
-        tcp:
           Value: true
         upperarm_link:
-          Value: false
+          Value: true
         wrist1_link:
-          Value: false
+          Value: true
         wrist2_link:
-          Value: false
+          Value: true
         wrist3_link:
-          Value: false
-      Marker Scale: 0.20000000298023224
+          Value: true
+      Marker Scale: 0.5
       Name: TF
       Show Arrows: true
       Show Axes: true
       Show Names: true
       Tree:
-        base_link:
-          shoulder_link:
-            upperarm_link:
-              forearm_link:
-                wrist1_link:
-                  wrist2_link:
-                    wrist3_link:
-                      endeffector:
-                        camera_hand_link:
-                          camera_hand_aligned_depth_to_infra1_frame:
-                            camera_hand_infra1_optical_frame:
-                              {}
-                          camera_hand_color_frame:
-                            camera_hand_color_optical_frame:
-                              {}
-                          camera_hand_depth_frame:
-                            camera_hand_depth_optical_frame:
-                              {}
-                          camera_hand_infra1_frame:
+        mf_manipulator_base_link:
+          base_link:
+            shoulder_link:
+              upperarm_link:
+                forearm_link:
+                  wrist1_link:
+                    wrist2_link:
+                      wrist3_link:
+                        mf_flange:
+                          camera_frame:
                             {}
-                        tcp:
-                          {}
-          target_pose_vendor_base:
-            {}
-        lift_end_link:
-          manipulator_base_link:
-            gm_0:
-              {}
-            gm_1:
-              {}
-            gm_10:
-              {}
-            gm_11:
-              {}
-            gm_12:
-              {}
-            gm_13:
-              {}
-            gm_14:
-              {}
-            gm_15:
-              {}
-            gm_16:
-              {}
-            gm_17:
-              {}
-            gm_18:
-              {}
-            gm_19:
-              {}
-            gm_2:
-              {}
-            gm_20:
-              {}
-            gm_21:
-              {}
-            gm_22:
-              {}
-            gm_23:
-              {}
-            gm_24:
-              {}
-            gm_25:
-              {}
-            gm_26:
-              {}
-            gm_27:
-              {}
-            gm_28:
-              {}
-            gm_29:
-              {}
-            gm_3:
-              {}
-            gm_30:
-              {}
-            gm_31:
-              {}
-            gm_32:
-              {}
-            gm_33:
-              {}
-            gm_34:
-              {}
-            gm_4:
-              {}
-            gm_5:
-              {}
-            gm_6:
-              {}
-            gm_7:
-              {}
-            gm_8:
-              {}
-            gm_9:
-              {}
-            input_pose_mf_frame:
-              {}
-            seedling_0:
-              {}
+                          mf_endeffector:
+                            mf_tcp:
+                              {}
       Update Interval: 0
-      Value: true
-    - Alpha: 1
-      Autocompute Intensity Bounds: true
-      Autocompute Value Bounds:
-        Max Value: 10
-        Min Value: -10
-        Value: true
-      Axis: Z
-      Channel Name: intensity
-      Class: rviz_default_plugins/PointCloud2
-      Color: 255; 255; 255
-      Color Transformer: RGB8
-      Decay Time: 0
-      Enabled: true
-      Invert Rainbow: false
-      Max Color: 255; 255; 255
-      Max Intensity: 4096
-      Min Color: 0; 0; 0
-      Min Intensity: 0
-      Name: PointCloud2
-      Position Transformer: XYZ
-      Selectable: true
-      Size (Pixels): 3
-      Size (m): 0.009999999776482582
-      Style: Flat Squares
-      Topic:
-        Depth: 5
-        Durability Policy: Volatile
-        Filter size: 10
-        History Policy: Keep Last
-        Reliability Policy: Reliable
-        Value: /camera/camera_hand/depth/color/points
-      Use Fixed Frame: true
-      Use rainbow: true
       Value: true
   Enabled: true
   Global Options:
@@ -476,41 +302,41 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz_default_plugins/Orbit
-      Distance: 2.0543978214263916
+      Distance: 2.347142219543457
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
         Swap Stereo Eyes: false
         Value: false
       Focal Point:
-        X: 0.01680806279182434
-        Y: -0.22563621401786804
-        Z: -0.19108907878398895
+        X: -0.10000000149011612
+        Y: 0.25
+        Z: 0.30000001192092896
       Focal Shape Fixed Size: true
       Focal Shape Size: 0.05000000074505806
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: 1.2899994850158691
+      Pitch: 0.4099997580051422
       Target Frame: base_link
       Value: Orbit (rviz_default_plugins)
-      Yaw: 1.3351750373840332
+      Yaw: 4.87517786026001
     Saved: ~
 Window Geometry:
   Displays:
-    collapsed: false
-  Height: 1016
+    collapsed: true
+  Height: 848
   Help:
     collapsed: false
-  Hide Left Dock: false
+  Hide Left Dock: true
   Hide Right Dock: false
   MotionPlanning:
-    collapsed: false
+    collapsed: true
   MotionPlanning - Trajectory Slider:
     collapsed: false
-  QMainWindow State: 000000ff00000000fd0000000100000000000002b4000003a2fc0200000005fb00000044004d006f00740069006f006e0050006c0061006e006e0069006e00670020002d0020005400720061006a006500630074006f0072007900200053006c00690064006500720000000000ffffffff0000003f00fffffffb000000100044006900730070006c006100790073010000003b00000228000000c700fffffffb0000001c004d006f00740069006f006e0050006c0061006e006e0069006e00670100000269000001740000016900fffffffb0000000800480065006c0070000000029a0000006e0000006e00fffffffb0000000a00560069006500770073000000031e000000bf000000a000ffffff00000480000003a200000004000000040000000800000008fc0000000100000002000000010000000a0054006f006f006c00730100000000ffffffff0000000000000000
+  QMainWindow State: 000000ff00000000fd0000000100000000000002b4000002f6fc0200000005fb00000044004d006f00740069006f006e0050006c0061006e006e0069006e00670020002d0020005400720061006a006500630074006f0072007900200053006c00690064006500720000000000ffffffff0000004100fffffffb000000100044006900730070006c006100790073000000003d000000c9000000c900fffffffb0000001c004d006f00740069006f006e0050006c0061006e006e0069006e0067000000010c0000017d0000017d00fffffffb0000000800480065006c0070000000029a0000006e0000006e00fffffffb0000000a00560069006500770073000000028f000000a4000000a400ffffff00000339000002f600000004000000040000000800000008fc0000000100000002000000010000000a0054006f006f006c00730100000000ffffffff0000000000000000
   Views:
-    collapsed: false
-  Width: 1850
-  X: 70
-  Y: 27
+    collapsed: true
+  Width: 825
+  X: 490
+  Y: 422
