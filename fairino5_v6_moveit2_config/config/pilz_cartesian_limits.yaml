@@ -1,6 +1,28 @@
+# # Limits for the Pilz planner
+# # Reduced max_trans_vel to prevent joint velocity limit violations
+# # When converting cartesian velocity to joint velocity, the resulting joint velocities
+# # can exceed limits, especially for joints far from the base (like j1)
+# # For a 6-DOF robot with joint velocity limit of 3.14 rad/s, max_trans_vel should be
+# # much lower to ensure joint velocities stay within limits during conversion
+# #
+# # Calculation: If j1 has max velocity 3.14 rad/s and robot arm length is ~0.8m,
+# # then max_trans_vel should be approximately: 3.14 * 0.8 / safety_factor
+# # With safety_factor of 10-20, max_trans_vel should be around 0.05-0.1 m/s
+# # But since j1 is base joint, even smaller movements can cause high rotation,
+# # so we use even more conservative value: 0.03 m/s
+# cartesian_limits:
+#   max_trans_vel: 0.05  # Balanced value: fast enough for linear motion, safe for joint limits
+#   max_trans_acc: 0.15  # Increased to match higher velocity
+#   max_trans_dec: -0.15  # Increased to match higher velocity
+#   max_rot_vel: 0.3     # Increased for better linear motion speed
 # Limits for the Pilz planner
+# Reduced max_trans_vel to prevent joint velocity limit violations
+# When converting cartesian velocity to joint velocity, the resulting joint velocities
+# can exceed limits, especially for joints far from the base (like j1)
+# For a 6-DOF robot with joint velocity limit of 3.14 rad/s, max_trans_vel should be
+# much lower to ensure joint velocities stay within limits during conversion
 cartesian_limits:
-  max_trans_vel: 1.0
-  max_trans_acc: 2.25
-  max_trans_dec: -5.0
-  max_rot_vel: 1.57
+  max_trans_vel: 0.5  # Further reduced from 1.0 to prevent joint velocity violations
+  max_trans_acc: 0.5  # Reduced from 2.25
+  max_trans_dec: -0.5  # Reduced from -5.0
+  max_rot_vel: 1.57  # Reduced from 0.5
