@@ -1,5 +1,6 @@
 #include "fairino_hardware/command_server.hpp"
 #include "rclcpp/rclcpp.hpp"
+#include "libfairino/include/robot.h"
 
 int main(int argc, char *argv[]){
     //该main函数用于创建简化指令客户端的app
