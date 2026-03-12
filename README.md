@@ -1,4 +1,3 @@
 # frcobot_ros2
-该项目为法奥机器人ROS2 API接口，基于法奥SDK库，简化了参数并提供了service接口，用户可以发送字符串指令到接口实现对应的功能。
-API函数的介绍见API说明.md文件
-安装教程及说明可以参考法奥文档平台的内容: https://fr-documentation.readthedocs.io/zh_CN/latest/ROSGuide/ros2guide.html
+- 3.7.5 QX version (frv5 firmware)
+- 만약 Web 접속 시에 로봇 조인트 컨트롤이 안되거나, ROBOT model 을 찾을 수 없다는 에러를 봤다면 컨트롤러 버전과 로봇 버전이 상이한 겁니다
