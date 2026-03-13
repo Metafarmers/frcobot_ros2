@@ -7,7 +7,17 @@ hardware_interface::CallbackReturn FairinoHardwareInterface::on_init(const hardw
         return hardware_interface::CallbackReturn::ERROR;
     }
     info_ = sysinfo;//info_是父类中定义的变量
-    
+
+    // read robot_ip from URDF <ros2_control> hardware parameters
+    auto it = info_.hardware_parameters.find("robot_ip");
+    if (it != info_.hardware_parameters.end()) {
+        _robot_ip = it->second;
+        RCLCPP_INFO(rclcpp::get_logger("FairinoHardwareInterface"), "Robot IP from parameter: %s", _robot_ip.c_str());
+    } else {
+        RCLCPP_WARN(rclcpp::get_logger("FairinoHardwareInterface"),
+                    "No 'robot_ip' parameter found, using default: %s", _robot_ip.c_str());
+    }
+
     for (const hardware_interface::ComponentInfo& joint : info_.joints) {
 
         //指令部分
@@ -108,7 +118,8 @@ hardware_interface::CallbackReturn FairinoHardwareInterface::on_activate(const r
     using namespace std::chrono_literals;
     RCLCPP_INFO(rclcpp::get_logger("FairinoHardwareInterface"), "Starting ...please wait...");
     //做变量的初始化工作
-    _ptr_robot = std::make_unique<fairino_robot>();//创建机器人实例
+    RCLCPP_INFO(rclcpp::get_logger("FairinoHardwareInterface"), "Connecting to robot at %s ...", _robot_ip.c_str());
+    _ptr_robot = std::make_unique<fairino_robot>(_robot_ip);//创建机器人实例
     for(int i=0;i<6;i++){//初始化变量
         _jnt_position_command[i] = 0;
         _jnt_velocity_command[i] = 0;

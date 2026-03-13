@@ -106,6 +106,7 @@ robot_command_thread::robot_command_thread(const std::string node_name):FRAPI_ba
     this->declare_parameter<float>("Spline_acc",0);
     this->declare_parameter<float>("Spline_ovl",100);
     this->declare_parameter<float>("NewSpline_blendR",10);
+    this->declare_parameter<std::string>("robot_ip", CONTROLLER_IP);
 
     _recv_ros_command_server = this->create_service<remote_cmd_server_srv_msg>(
         REMOTE_CMD_SERVER_NAME,
@@ -117,7 +118,8 @@ robot_command_thread::robot_command_thread(const std::string node_name):FRAPI_ba
         std::bind(&robot_command_thread::_ParseROSScript_callback,this,std::placeholders::_1,std::placeholders::_2)
     );
 
-    _controller_ip = CONTROLLER_IP;//控制器默认ip地址
+    _controller_ip = this->get_parameter("robot_ip").as_string();
+    RCLCPP_INFO(this->get_logger(),"Robot ip:%s",_controller_ip.c_str());
     std::cout << "开始创建TCP socket  版本号:V2.1.20240913" << std::endl;
     _socketfd1 = socket(AF_INET,SOCK_STREAM,0);
     _socketfd2 = socket(AF_INET,SOCK_STREAM,0);
@@ -1701,10 +1703,10 @@ int robot_command_thread::setKeepAlive(int fd, int idle_time, int interval_time,
 
 /******状态信息获取节点******/
 /*************************/
-robot_recv_thread::robot_recv_thread(const std::string node_name):rclcpp::Node(node_name)
+robot_recv_thread::robot_recv_thread(const std::string node_name, const std::string& robot_ip):rclcpp::Node(node_name)
 {
     using namespace std::chrono_literals;
-    _controller_ip = CONTROLLER_IP;//控制器默认ip地址
+    _controller_ip = robot_ip;
     std::cout << "开始创建状态反馈TCP socket" << std::endl;
 
     //只保留8081端口的连接，8083连接传输的数据已经不用

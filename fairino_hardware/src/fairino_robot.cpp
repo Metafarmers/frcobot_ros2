@@ -2,10 +2,10 @@
 
 namespace fairino_hardware{
 
-fairino_robot::fairino_robot(){
+fairino_robot::fairino_robot(const std::string& robot_ip){
 //配置状态反馈端口，引入xmlrpc库
     _control_mode = 0;
-    _controller_ip = CONTROLLER_IP;//控制器默认ip地址
+    _controller_ip = robot_ip;
     RCLCPP_INFO(rclcpp::get_logger("FrHardwareInterface"),"fairino_robot:开始创建状态反馈socket");    
     _socket_state = socket(AF_INET,SOCK_STREAM,0);//状态获取端口只有TCP
     if(_socket_state == -1){

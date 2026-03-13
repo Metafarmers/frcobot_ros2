@@ -51,6 +51,7 @@ public:
   hardware_interface::return_type write(const rclcpp::Time & time, const rclcpp::Duration & period) override;
   
 private:
+  std::string _robot_ip = CONTROLLER_IP;
   double _jnt_position_command[6];
   double _jnt_velocity_command[6];
   double _jnt_torque_command[6];

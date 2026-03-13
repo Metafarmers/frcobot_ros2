@@ -370,7 +370,7 @@ private:
 
 class robot_recv_thread:public rclcpp::Node{//接受非实时和实时反馈数据的节点
 public:
-    explicit robot_recv_thread(const std::string node_name);
+    explicit robot_recv_thread(const std::string node_name, const std::string& robot_ip = CONTROLLER_IP);
     ~robot_recv_thread();
 private:
     int setKeepAlive(int fd, int idle_time, int interval_time, int probe_times);

@@ -16,7 +16,7 @@
 namespace fairino_hardware{
 class fairino_robot{
 public:
-    explicit fairino_robot();
+    explicit fairino_robot(const std::string& robot_ip = CONTROLLER_IP);
     ~fairino_robot();
     int inittorquecontrol();
     int initpositioncontrol();

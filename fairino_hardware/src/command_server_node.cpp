@@ -8,8 +8,10 @@ int main(int argc, char *argv[]){
     //创建用户指令节点
     auto command_server_node = std::make_shared<robot_command_thread>("fr_command_server");
     mulexecutor.add_node(command_server_node);
+    // command_server에서 읽은 robot_ip를 state 노드에도 전달
+    std::string robot_ip = command_server_node->get_parameter("robot_ip").as_string();
     //创建非实时状态反馈获取节点
-    auto robot_state_node = std::make_shared<robot_recv_thread>("fr_state_brodcast");
+    auto robot_state_node = std::make_shared<robot_recv_thread>("fr_state_brodcast", robot_ip);
     mulexecutor.add_node(robot_state_node);//状态反馈节点加入执行器
     mulexecutor.spin();
     rclcpp::shutdown();
