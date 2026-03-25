@@ -7,7 +7,17 @@ hardware_interface::CallbackReturn FairinoHardwareInterface::on_init(const hardw
         return hardware_interface::CallbackReturn::ERROR;
     }
     info_ = sysinfo;//info_是父类中定义的变量
-    
+
+    // read robot_ip from URDF <ros2_control> hardware parameters
+    auto it = info_.hardware_parameters.find("robot_ip");
+    if (it != info_.hardware_parameters.end()) {
+        _controller_ip = it->second;
+        RCLCPP_INFO(rclcpp::get_logger("FairinoHardwareInterface"), "Robot IP from parameter: %s", _controller_ip.c_str());
+    } else {
+        RCLCPP_WARN(rclcpp::get_logger("FairinoHardwareInterface"),
+                    "No 'robot_ip' parameter found, using default: %s", _controller_ip.c_str());
+    }
+
     for (const hardware_interface::ComponentInfo& joint : info_.joints) {
 
         //指令部分
@@ -117,13 +127,15 @@ hardware_interface::CallbackReturn FairinoHardwareInterface::on_activate(const r
         _jnt_torque_state[i] = 0;
     }
     _control_mode = 0;//默认是位置控制,0-位置控制，1-扭矩控制 2-速度控制
+    RCLCPP_INFO(rclcpp::get_logger("FairinoHardwareInterface"), "Connecting to robot at %s ...", _controller_ip.c_str());
     errno_t returncode = _ptr_robot->RPC(_controller_ip.c_str());//建立xmlrpc连接
     rclcpp::sleep_for(200ms);//等待一段时间让控制器的rpc连接建立完毕
     if(returncode != 0){
-        RCLCPP_INFO(rclcpp::get_logger("FairinoHardwareInterface"), "机械臂SDK连接失败！请检查端口时候被占用");
+        RCLCPP_ERROR(rclcpp::get_logger("FairinoHardwareInterface"),
+                     "SDK connection failed (error=%d) to %s", returncode, _controller_ip.c_str());
         return hardware_interface::CallbackReturn::ERROR;
     }else{
-        RCLCPP_INFO(rclcpp::get_logger("FairinoHardwareInterface"), "机械臂SDK连接成功！");
+        RCLCPP_INFO(rclcpp::get_logger("FairinoHardwareInterface"), "SDK connected to %s", _controller_ip.c_str());
     }
     //做第一步的工作，读取当前状态数据
     JointPos jntpos;

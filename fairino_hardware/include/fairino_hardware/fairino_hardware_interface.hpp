@@ -12,7 +12,7 @@
 #include "libfairino/include/robot.h"
 
 
-#define CONTROLLER_IP_ADDRESS "192.168.58.2"
+#define CONTROLLER_IP_ADDRESS "192.168.50.101"
 
 namespace fairino_hardware
 {
@@ -23,9 +23,6 @@ public:
 
   FAIRINO_HARDWARE_PUBLIC
   hardware_interface::CallbackReturn on_init(const hardware_interface::HardwareInfo& info) override;
-
-  //FAIRINO_HARDWARE_PUBLIC
-  //hardware_interface::CallbackReturn on_configure(const rclcpp_lifecycle::State &) override;
 
   FAIRINO_HARDWARE_PUBLIC
   hardware_interface::CallbackReturn on_activate(const rclcpp_lifecycle::State& previous_state) override;
