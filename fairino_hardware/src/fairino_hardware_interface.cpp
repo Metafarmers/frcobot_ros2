@@ -149,8 +149,14 @@ hardware_interface::CallbackReturn FairinoHardwareInterface::on_activate(const r
             _jnt_position_command[j] = jntpos.jPos[j]/180.0*M_PI;
         }
         RCLCPP_INFO(rclcpp::get_logger("FairinoHardwareInterface"),"初始指令位置: %f,%f,%f,%f,%f,%f",_jnt_position_command[0],\
-        _jnt_position_command[1],_jnt_position_command[2],_jnt_position_command[3],_jnt_position_command[4],_jnt_position_command[5]);    
-        RCLCPP_INFO(rclcpp::get_logger("FairinoHardwareInterface"), "机械臂硬件启动成功!");
+        _jnt_position_command[1],_jnt_position_command[2],_jnt_position_command[3],_jnt_position_command[4],_jnt_position_command[5]);
+        // Enter servo mode before ServoJ commands
+        returncode = _ptr_robot->ServoMoveStart();
+        if(returncode != 0){
+            RCLCPP_ERROR(rclcpp::get_logger("FairinoHardwareInterface"), "ServoMoveStart failed (error=%d)", returncode);
+            return hardware_interface::CallbackReturn::ERROR;
+        }
+        RCLCPP_INFO(rclcpp::get_logger("FairinoHardwareInterface"), "ServoMoveStart OK. Hardware activated.");
         return hardware_interface::CallbackReturn::SUCCESS;
     }else{
         RCLCPP_INFO(rclcpp::get_logger("FairinoHardwareInterface"), "读取初始关节角度错误，硬件无法启动！请检查通讯内容");
@@ -163,6 +169,7 @@ hardware_interface::CallbackReturn FairinoHardwareInterface::on_activate(const r
 hardware_interface::CallbackReturn FairinoHardwareInterface::on_deactivate(const rclcpp_lifecycle::State& previous_state)
 {
     RCLCPP_INFO(rclcpp::get_logger("FairinoHardwareInterface"), "Stopping ...please wait...");
+    _ptr_robot->ServoMoveEnd();//退出伺服模式
     _ptr_robot->StopMotion();//停止机器人
     _ptr_robot->CloseRPC();//销毁实例，连接断开
     _ptr_robot.release();
