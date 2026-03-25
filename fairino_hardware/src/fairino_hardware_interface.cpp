@@ -224,7 +224,20 @@ hardware_interface::return_type FairinoHardwareInterface::write(const rclcpp::Ti
             cmd.jPos[0],cmd.jPos[1],cmd.jPos[2],cmd.jPos[3],cmd.jPos[4],cmd.jPos[5]);
         int returncode = _ptr_robot->ServoJ(&cmd,&extcmd,0,0,0.008,0,0);
         if(returncode != 0){
-            RCLCPP_INFO(rclcpp::get_logger("FairinoHardwareInterface"), "ServoJ指令下发错误,错误码:%d",returncode);
+            _servo_error_count++;
+            if(_servo_error_count <= 3){
+                RCLCPP_WARN(rclcpp::get_logger("FairinoHardwareInterface"), "ServoJ error=%d, attempting recovery (%d)...", returncode, _servo_error_count);
+                _ptr_robot->ResetAllError();
+                _ptr_robot->ServoMoveStart();
+            } else if(_servo_error_count % 500 == 0){
+                // Throttle logging after initial retries
+                RCLCPP_WARN(rclcpp::get_logger("FairinoHardwareInterface"), "ServoJ error=%d persists (count=%d)", returncode, _servo_error_count);
+            }
+        } else {
+            if(_servo_error_count > 0){
+                RCLCPP_INFO(rclcpp::get_logger("FairinoHardwareInterface"), "ServoJ recovered after %d errors", _servo_error_count);
+            }
+            _servo_error_count = 0;
         }
     }else if(_control_mode == 1){//扭矩控制模式
         if (std::any_of(&_jnt_torque_command[0], &_jnt_torque_command[5],\

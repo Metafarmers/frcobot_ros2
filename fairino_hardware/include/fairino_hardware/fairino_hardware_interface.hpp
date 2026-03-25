@@ -59,6 +59,7 @@ private:
   int _control_mode;
   std::string _controller_ip = CONTROLLER_IP_ADDRESS;
   std::unique_ptr<FRRobot> _ptr_robot;
+  int _servo_error_count = 0;
 };
 
 } //end namespace
