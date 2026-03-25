@@ -137,6 +137,16 @@ hardware_interface::CallbackReturn FairinoHardwareInterface::on_activate(const r
     }else{
         RCLCPP_INFO(rclcpp::get_logger("FairinoHardwareInterface"), "SDK connected to %s", _controller_ip.c_str());
     }
+    // Clear any existing errors and enable the robot
+    _ptr_robot->ResetAllError();
+    rclcpp::sleep_for(100ms);
+    returncode = _ptr_robot->RobotEnable(1);
+    if(returncode != 0){
+        RCLCPP_WARN(rclcpp::get_logger("FairinoHardwareInterface"), "RobotEnable failed (error=%d), may already be enabled", returncode);
+    } else {
+        RCLCPP_INFO(rclcpp::get_logger("FairinoHardwareInterface"), "Robot enabled");
+    }
+    rclcpp::sleep_for(100ms);
     //做第一步的工作，读取当前状态数据
     JointPos jntpos;
     returncode = _ptr_robot->GetActualJointPosDegree(0,&jntpos);
