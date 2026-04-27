@@ -94,24 +94,16 @@ install(TARGETS fairino_hardware
   LIBRARY DESTINATION lib/${PROJECT_NAME}
 )
 
-#copy fairino SDK lib file to specfic path
-file(MAKE_DIRECTORY 
-"${CMAKE_INSTALL_PREFIX}/lib/${PROJECT_NAME}"
+#install fairino SDK shared lib (preserves symlinks, honors DESTDIR)
+# 기존 file(COPY_FILE)/file(CREATE_LINK) 는 configure 시점에 호스트
+# CMAKE_INSTALL_PREFIX 에 직접 쓰므로 dpkg-buildpackage 의 staging dir
+# (debian/<pkg>/) 에는 들어가지 않음 → dpkg-shlibdeps 가 libfairino.so.2 를
+# 못 찾아 fail. install(DIRECTORY ...) 는 install 시점에 DESTDIR 를 거치므로
+# 정상 packaging 됨.
+install(DIRECTORY libfairino/lib/
+  DESTINATION lib
+  FILES_MATCHING PATTERN "libfairino*"
 )
-
-file(COPY_FILE "libfairino/lib/libfairino.so.2.3.2" 
-"${CMAKE_INSTALL_PREFIX}/lib/libfairino.so.2.3.2" 
-)
-
-file(CREATE_LINK 
-"${CMAKE_INSTALL_PREFIX}/lib/libfairino.so.2.3.2" 
-"${CMAKE_INSTALL_PREFIX}/lib/libfairino.so.2" 
-SYMBOLIC)
-
-file(CREATE_LINK 
-"${CMAKE_INSTALL_PREFIX}/lib/libfairino.so.2" 
-"${CMAKE_INSTALL_PREFIX}/lib/libfairino.so" 
-SYMBOLIC)
 
 
 if(BUILD_TESTING)
