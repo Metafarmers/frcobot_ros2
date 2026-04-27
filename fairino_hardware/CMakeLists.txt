@@ -77,6 +77,15 @@ ament_target_dependencies(fairino_hardware
 #export hardware plugins
 pluginlib_export_plugin_description_file(hardware_interface fairino_hardware.xml)
 
+# INSTALL_RPATH = $ORIGIN/.. → 바이너리/라이브러리가 (lib/${PROJECT_NAME}/) 에서
+# 자기 디렉토리 상위 (= lib/) 의 libfairino.so.2 를 찾음. mf_apt 의 prefix 가
+# /opt/ros/humble 가 아닌 /opt/metafarmers/ros/humble 라 dpkg-shlibdeps 가
+# 기본 경로 (-l/opt/ros/humble/lib/) 에서 못 찾는 문제 해결 (RPATH 통해 resolve).
+set_target_properties(ros2_cmd_server srv_test_client fairino_hardware PROPERTIES
+  INSTALL_RPATH "\$ORIGIN/.."
+  BUILD_WITH_INSTALL_RPATH TRUE
+)
+
 #install all files
 #command server
 install(TARGETS ros2_cmd_server
