@@ -25,15 +25,16 @@ file(GLOB SRC_DIR ./src/command_server.cpp ./src/command_server_node.cpp)
 file(GLOB EXP_SRC_DIR ./examples/src/*.cpp)
 
 #compile
-file(CREATE_LINK 
-"${CMAKE_CURRENT_SOURCE_DIR}/libfairino/lib/libfairino.so.2.3.2"
-"${CMAKE_CURRENT_SOURCE_DIR}/libfairino/lib/libfairino.so.2"
-SYMBOLIC)
-
-file(CREATE_LINK 
-"${CMAKE_CURRENT_SOURCE_DIR}/libfairino/lib/libfairino.so.2"
-"${CMAKE_CURRENT_SOURCE_DIR}/libfairino/lib/libfairino.so"
-SYMBOLIC)
+# 소스 트리에 RELATIVE 심볼릭 링크 생성 (build 시 target_link_libraries 가
+# libfairino.so 를 찾도록). 절대 경로는 commit 시 다른 머신에서 broken 됨.
+file(CREATE_LINK
+  "libfairino.so.2.3.2"
+  "${CMAKE_CURRENT_SOURCE_DIR}/libfairino/lib/libfairino.so.2"
+  SYMBOLIC)
+file(CREATE_LINK
+  "libfairino.so.2"
+  "${CMAKE_CURRENT_SOURCE_DIR}/libfairino/lib/libfairino.so"
+  SYMBOLIC)
 
 add_executable(ros2_cmd_server ${SRC_DIR})
 add_executable(srv_test_client ${EXP_SRC_DIR})
@@ -94,16 +95,18 @@ install(TARGETS fairino_hardware
   LIBRARY DESTINATION lib/${PROJECT_NAME}
 )
 
-#install fairino SDK shared lib (preserves symlinks, honors DESTDIR)
-# 기존 file(COPY_FILE)/file(CREATE_LINK) 는 configure 시점에 호스트
-# CMAKE_INSTALL_PREFIX 에 직접 쓰므로 dpkg-buildpackage 의 staging dir
-# (debian/<pkg>/) 에는 들어가지 않음 → dpkg-shlibdeps 가 libfairino.so.2 를
-# 못 찾아 fail. install(DIRECTORY ...) 는 install 시점에 DESTDIR 를 거치므로
-# 정상 packaging 됨.
-install(DIRECTORY libfairino/lib/
-  DESTINATION lib
-  FILES_MATCHING PATTERN "libfairino*"
-)
+# install fairino SDK shared lib + relative symlinks (DESTDIR 경유).
+# install(DIRECTORY) + FILES_MATCHING 은 일부 CMake 버전에서 symlink 누락
+# (특히 repo 에 broken 절대 경로 symlink 가 commit 돼 있던 경우) → 명시적으로
+# install(FILES) + install(CODE) 로 relative symlink 생성.
+install(FILES libfairino/lib/libfairino.so.2.3.2 DESTINATION lib)
+install(CODE "
+  set(_dest \"\$ENV{DESTDIR}\${CMAKE_INSTALL_PREFIX}/lib\")
+  execute_process(COMMAND \${CMAKE_COMMAND} -E create_symlink
+    libfairino.so.2.3.2 \${_dest}/libfairino.so.2)
+  execute_process(COMMAND \${CMAKE_COMMAND} -E create_symlink
+    libfairino.so.2 \${_dest}/libfairino.so)
+")
 
 
 if(BUILD_TESTING)
