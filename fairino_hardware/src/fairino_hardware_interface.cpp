@@ -1,14 +1,55 @@
+#include <algorithm>
+#include <cmath>
+#include <cstdlib>
 #include <limits>
 
 #include "fairino_hardware/fairino_hardware_interface.hpp"
 
 namespace fairino_hardware{
 
+FairinoHardwareInterface::~FairinoHardwareInterface() { stopServiceThread(); }
+
+void FairinoHardwareInterface::stopServiceThread() {
+    if (_svc_exec) _svc_exec->cancel();
+    if (_svc_spin_thread.joinable()) _svc_spin_thread.join();
+    if (_svc_exec && _svc_node) _svc_exec->remove_node(_svc_node);
+    _svc_exec.reset();
+    diagnostics_timer_.reset();
+    diagnostics_pub_.reset();
+    flush_srv_.reset();
+    stop_hold_srv_.reset();
+    flush_callback_group_.reset();
+    _drag_srv.reset();
+    _svc_node.reset();
+}
+
 hardware_interface::CallbackReturn FairinoHardwareInterface::on_init(const hardware_interface::HardwareInfo& sysinfo){
     if (hardware_interface::SystemInterface::on_init(sysinfo) != hardware_interface::CallbackReturn::SUCCESS) {
         return hardware_interface::CallbackReturn::ERROR;
     }
     info_ = sysinfo;//info_是父类中定义的变量
+
+    servo_command_period_sec_ = 0.02;
+    const auto period_parameter = info_.hardware_parameters.find("servo_command_period_sec");
+    if (period_parameter != info_.hardware_parameters.end()) {
+        try {
+            size_t parsed = 0;
+            const double value = std::stod(period_parameter->second, &parsed);
+            // Deployment keeps a 50 Hz controller. Reject shorter interpolation
+            // periods (including the old 8 ms value), junk, NaN and infinity.
+            if (parsed != period_parameter->second.size() || !std::isfinite(value) ||
+                value < 0.02 || value > 0.1) throw std::invalid_argument("period");
+            servo_command_period_sec_ = value;
+        } catch (const std::exception&) {
+            RCLCPP_ERROR(rclcpp::get_logger("FairinoHardwareInterface"),
+                         "servo_command_period_sec must be finite and in [0.02, 0.1] seconds");
+            return hardware_interface::CallbackReturn::ERROR;
+        }
+    }
+    if (info_.joints.size() != 6) {
+        RCLCPP_ERROR(rclcpp::get_logger("FairinoHardwareInterface"), "Exactly six joints are required");
+        return hardware_interface::CallbackReturn::ERROR;
+    }
 
     // read robot_ip from URDF <ros2_control> hardware parameters
     auto it = info_.hardware_parameters.find("robot_ip");
@@ -114,13 +155,13 @@ std::vector<hardware_interface::CommandInterface> FairinoHardwareInterface::expo
 
 
 
-hardware_interface::CallbackReturn FairinoHardwareInterface::on_activate(const rclcpp_lifecycle::State& previous_state)
+hardware_interface::CallbackReturn FairinoHardwareInterface::on_activate(const rclcpp_lifecycle::State&)
 {
     using namespace std::chrono_literals;
     RCLCPP_INFO(rclcpp::get_logger("FairinoHardwareInterface"), "Starting ...please wait...");
     RCLCPP_INFO(rclcpp::get_logger("FairinoHardwareInterface"),
-                "[servo-diagnostics] build=2026-09-10-v2 cmdT=0.020000 s "
-                "hold_release_threshold=0.005000 rad");
+                "[servo-diagnostics] cmdT=%.6f s cancel_hold_release_tolerance=0.005000 rad",
+                servo_command_period_sec_);
     //做变量的初始化工作
     _ptr_robot = std::make_unique<FRRobot>();//创建机器人实例
     for(int i=0;i<6;i++){//初始化变量
@@ -162,7 +203,21 @@ hardware_interface::CallbackReturn FairinoHardwareInterface::on_activate(const r
     if(returncode == 0){
         for(int j=0;j<6;j++){
             _jnt_position_command[j] = jntpos.jPos[j]/180.0*M_PI;
+            _jnt_position_state[j] = _jnt_position_command[j];
         }
+        rt_valid_ = false;
+        rt_available_for_write_ = false;
+        rt_frame_seen_ = false;
+        last_write_at_ = {};
+        flush_phase_ = FlushPhase::IDLE;
+        flush_active_generation_ = 0;
+        flush_requested_.store(0);
+        flush_completed_.store(0);
+        flush_result_.store(static_cast<int>(FlushResult::NONE));
+        flush_resume_requested_.store(true);
+        hard_inhibit_.store(false);
+        cancel_hold_ = false;
+        flush_inhibit_ = false;
         RCLCPP_INFO(rclcpp::get_logger("FairinoHardwareInterface"),"初始指令位置: %f,%f,%f,%f,%f,%f",_jnt_position_command[0],\
         _jnt_position_command[1],_jnt_position_command[2],_jnt_position_command[3],_jnt_position_command[4],_jnt_position_command[5]);
         // Enter servo mode before ServoJ commands
@@ -183,8 +238,24 @@ hardware_interface::CallbackReturn FairinoHardwareInterface::on_activate(const r
                 resp->success = true;
                 resp->message = req->data ? "drag ON requested" : "drag OFF requested";
             });
+        flush_callback_group_ = _svc_node->create_callback_group(rclcpp::CallbackGroupType::Reentrant);
+        flush_srv_ = _svc_node->create_service<std_srvs::srv::Trigger>(
+            "/fairino_hw_control/stop_and_flush",
+            [this](std::shared_ptr<std_srvs::srv::Trigger::Request>,
+                   std::shared_ptr<std_srvs::srv::Trigger::Response> response) {
+                requestStopAndFlush(*response, true);
+            }, rmw_qos_profile_services_default, flush_callback_group_);
+        stop_hold_srv_ = _svc_node->create_service<std_srvs::srv::Trigger>(
+            "/fairino_hw_control/stop_and_hold",
+            [this](std::shared_ptr<std_srvs::srv::Trigger::Request>,
+                   std::shared_ptr<std_srvs::srv::Trigger::Response> response) {
+                requestStopAndFlush(*response, false);
+            }, rmw_qos_profile_services_default, flush_callback_group_);
+        diagnostics_pub_ = _svc_node->create_publisher<diagnostic_msgs::msg::DiagnosticArray>(
+            "/diagnostics", rclcpp::QoS(10));
+        diagnostics_timer_ = _svc_node->create_wall_timer(100ms, [this]() { publishDiagnostics(); });
         // ★서비스 spin 을 별도 스레드로 — 실시간 write() 루프서 spin_some 을 부르던 걸 대체(지터 제거).
-        _svc_exec = std::make_shared<rclcpp::executors::SingleThreadedExecutor>();
+        _svc_exec = std::make_shared<rclcpp::executors::MultiThreadedExecutor>(rclcpp::ExecutorOptions(), 2);
         _svc_exec->add_node(_svc_node);
         _svc_spin_thread = std::thread([this](){ _svc_exec->spin(); });
         RCLCPP_INFO(rclcpp::get_logger("FairinoHardwareInterface"),
@@ -198,269 +269,506 @@ hardware_interface::CallbackReturn FairinoHardwareInterface::on_activate(const r
 
 
 
-hardware_interface::CallbackReturn FairinoHardwareInterface::on_deactivate(const rclcpp_lifecycle::State& previous_state)
+hardware_interface::CallbackReturn FairinoHardwareInterface::on_deactivate(const rclcpp_lifecycle::State&)
 {
     RCLCPP_INFO(rclcpp::get_logger("FairinoHardwareInterface"), "Stopping ...please wait...");
     // ★백그라운드 서비스 spin 정지: executor cancel → 스레드 join → 리소스 해제(순서 중요).
-    if(_svc_exec){ _svc_exec->cancel(); }
-    if(_svc_spin_thread.joinable()){ _svc_spin_thread.join(); }
-    if(_svc_exec && _svc_node){ _svc_exec->remove_node(_svc_node); }
-    _svc_exec.reset();
-    _drag_srv.reset();          // ★손교시 언락 서비스 정리
-    _svc_node.reset();
+    stopServiceThread();
     _ptr_robot->ServoMoveEnd();//退出伺服模式
     _ptr_robot->StopMotion();//停止机器人
     _ptr_robot->CloseRPC();//销毁实例，连接断开
-    _ptr_robot.release();
+    _ptr_robot.reset();
     RCLCPP_INFO(rclcpp::get_logger("FairinoHardwareInterface"), "System successfully stopped!");
     return hardware_interface::CallbackReturn::SUCCESS;
 }
 
 
 
-hardware_interface::return_type FairinoHardwareInterface::read(const rclcpp::Time& time,const rclcpp::Duration& period)
-{//从RTDE反馈数据中获取所需的位置，速度和扭矩信息
-    JointPos state_data;
-    error_t returncode = _ptr_robot->GetActualJointPosDegree(1,&state_data);
-    if(returncode == 0){
-        for(int i=0;i<6;i++){
-            _jnt_position_state[i] = state_data.jPos[i]/180.0*M_PI;//注意单位转换，moveit统一用弧度
-            //_jnt_torque_state[i] = state_data.jt_cur_tor[i];//注意单位转换
-        }
-    }else{
-        return hardware_interface::return_type::ERROR;
-    }
-    //RCLCPP_INFO(rclcpp::get_logger("FairinoHardwareInterface"), "System successfully read: %f,%f,%f,%f,%f,%f",_jnt_position_state[0],\
-    _jnt_position_state[1],_jnt_position_state[2],_jnt_position_state[3],_jnt_position_state[4],_jnt_position_state[5]);
-
-  return hardware_interface::return_type::OK;
-
+void FairinoHardwareInterface::recordRpc(
+    RpcIndex index, int rc, std::chrono::steady_clock::time_point start) {
+    auto& sample = control_diagnostics_.rpc[index];
+    sample.rc = rc;
+    sample.duration_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - start).count();
+    ++sample.calls;
 }
 
-hardware_interface::return_type FairinoHardwareInterface::write(const rclcpp::Time& time,const rclcpp::Duration& period)
-{
-    // ★손교시 SW 언락: 서비스 spin 은 백그라운드 스레드(_svc_exec)가 처리 — 여기선 원자변수만 읽는다
-    //   (실시간 루프에 spin_some 을 넣으면 executor 생성·파괴 지터로 ServoJ 가 뚝뚝 끊긴다). 요청 시
-    //   DragTeachSwitch(SDK)는 write 스레드에서 호출(SDK 단독 스레드 → 레이스 없음). read-and-clear 로
-    //   콜백이 세팅한 요청을 한 번에 소비(놓침 없음). 드래그 ON → robot_state==4 공존이 ServoJ 스킵.
-    // ★플랜지 드래그 버튼 hold-to-drag(사용자 2026-09-09): RT 상태를 루프 시작에서 1회 읽어(아래 estop/
-    //   drag 검출과 공용) tl_dgt_input_l bit0(active-LOW: 눌림=0)의 엣지를 본다. 눌림 엣지→_drag_req=1,
-    //   뗌 엣지→_drag_req=-1. 서비스와 공존. 버튼이 서보모드서 막혀도 여기서 감지해 ServoMoveEnd 로
-    //   드래그 진입시킨다(catch-22 해소). 드래그 중에도(아래 early-return 전) 매 사이클 읽어 뗌을 놓치지 않는다.
-    // ★[servo-freeze 진단 2026-09-10] 침묵 skip 분기(robot_state==4·safety_stop·post-hold)가 ServoJ 를
-    //   조용히 건너뛰어(return OK) visual_servo 가 'no raw joint progress' 로 abort 하는 원인을, 다음
-    //   실험 bag 에서 보이게 로그로 노출한다. ⚠RT 50Hz 루프라 THROTTLE(2s, steady clock)로 스팸·지터 방지.
-    static rclcpp::Clock _skip_clk(RCL_STEADY_TIME);
-    ROBOT_STATE_PKG _rt_pkg;
-    const bool _rt_ok = (_ptr_robot->GetRobotRealTimeState(&_rt_pkg) == 0);
-    if(_rt_ok){
-        const bool _btn = ((_rt_pkg.tl_dgt_input_l & 0x01) == 0);   // active-LOW: 눌림=bit0=0
-        if(_btn && !_drag_btn_prev)       _drag_req.store(1);       // 누름 엣지 → 드래그 ON
-        else if(!_btn && _drag_btn_prev)  _drag_req.store(-1);      // 뗌 엣지 → 드래그 OFF(hold 해제)
-        _drag_btn_prev = _btn;
-    }
-    const int _drag_cmd = _drag_req.exchange(0);
-    if(_drag_cmd == 1 && !_drag_active){
-        // 드래그 진입: ServoMove 가 켜져 있으면(서보 모드) DragTeachSwitch 만으론 드래그모드 진입이
-        // 막힌다 → 먼저 ServoMoveEnd 로 서보를 풀고 DragTeachSwitch(1). 같은 연결·write 스레드라
-        // 소켓 재생성 없음(SIGSEGV 는 CloseRPC+RPC 재연결 때였음).
-        errno_t _r1 = _ptr_robot->ServoMoveEnd();
-        errno_t _r2 = _ptr_robot->DragTeachSwitch(1);
-        _drag_active = true; _servo_error_count = 0;
-        RCLCPP_INFO(rclcpp::get_logger("FairinoHardwareInterface"),
-                    "드래그 ON: ServoMoveEnd rc=%d + DragTeachSwitch(1) rc=%d — 버튼+손으로 이동", (int)_r1, (int)_r2);
-    } else if(_drag_cmd == -1 && _drag_active){
-        // 드래그 종료: DragTeachSwitch(0) → ServoMoveStart 로 서보 재개.
-        // ★스프링백 방지(2026-09-09): 펜던트 드래그와 **동일하게** _post_drag_hold 를 켠다. 한 사이클
-        //   _jnt_position_command 채택만으론 다음 사이클 JTC 가 옛 setpoint 를 재발행해 팔이 옛 위치로
-        //   튀며 ServoJ error=14 가 무한 루프했다(SW OFF 에만 이 hold 가 빠져 있던 게 원인). 이제 새
-        //   goal(command 가 _pre_drag_cmd 서 0.005rad 넘게 벗어남) 전까지 _hold_target(손교시로 옮긴
-        //   현재 위치)을 ServoJ 목표로 유지 → 스프링백·error=14 루프 제거. (아래 post_drag_hold 실행부 공용.)
-        errno_t _r1 = _ptr_robot->DragTeachSwitch(0);
-        errno_t _r2 = _ptr_robot->ServoMoveStart();
-        for(int i=0;i<6;i++){
-            _hold_target[i]  = _jnt_position_state[i];    // 유지 목표 = 현재(손교시로 옮긴) 위치
-            _pre_drag_cmd[i] = _jnt_position_command[i];  // JTC 옛 command(=옛자세) = 새 goal 판정 기준
-            // ★_jnt_position_command 를 채택(=현재자세)하면 안 된다: 아래 post_drag_hold 검사
-            //   _dev=|_jnt_position_command − _pre_drag_cmd| 가 |손교시자세−옛자세|=큰값이 돼 hold 를
-            //   **즉시 해제**→JTC 옛 setpoint 로 튄다(버튼 떼면 원래대로 복귀 버그). command 는 JTC 값
-            //   (옛자세=_pre_drag_cmd) 그대로 둬야 _dev=0→hold 유지→_tgt=_hold_target(손교시자세)로 머문다.
-        }
-        _post_drag_hold = true;                           // 새 goal 전까지 현재 위치 유지(펜던트와 동일)
-        _drag_active = false; _servo_error_count = 0;
-        RCLCPP_INFO(rclcpp::get_logger("FairinoHardwareInterface"),
-                    "드래그 OFF: DragTeachSwitch(0) rc=%d + ServoMoveStart rc=%d (현재자세 유지·post_drag_hold)", (int)_r1, (int)_r2);
-    }
-    if(_drag_active){
-        for(int i=0;i<6;i++) _hold_target[i] = _jnt_position_state[i];   // 옮긴 위치 추적(off 시 채택)
-        return hardware_interface::return_type::OK;                     // 드래그 중 ServoJ 전면 스킵
-    }
-    if(_control_mode == 0){//位置控制模式
-        if (std::any_of(&_jnt_position_command[0], &_jnt_position_command[5],\
-            [](double c) { return not std::isfinite(c); })) {
-            return hardware_interface::return_type::ERROR;
-        }
-        // ── 손 티칭(펜던트 DRAG) 공존 ────────────────────────────────────────────
-        // 드래그 중(robot_state==4)엔 ServoJ 도, 그 error=14 복구(ResetAllError+ServoMoveStart)도
-        // 보내지 않는다 — 예전엔 이 복구가 매 사이클 드래그를 걷어차 팔을 옛 위치로 되돌렸다.
-        // 종료 후엔 JTC 가 옛 홀드 setpoint 를 유지하는 동안(command 가 진입 스냅샷과 동일) 옮긴 위치를
-        // 유지해 스프링백을 막고, 새 goal 이 오면(command 변화) 정상 ServoJ 로 복귀한다. FR5 JTC 는
-        // 유지해 스프링백을 막고, command 변화가 해제 임계값에 도달하면 정상 ServoJ로 복귀한다.
-        // FR5 JTC는 open_loop_control=true이므로 새 goal이 측정위치에서 시작한다고 가정할 수 없다.
-        // ★RT 상태는 write() 상단에서 이미 1회 읽었다(_rt_pkg, _rt_ok) — 버튼·estop·drag 공용(중복 RPC 제거).
-        const bool _drag  = _rt_ok && (_rt_pkg.robot_state == 4);   // 4 = 拖动(펜던트/버튼 드래그)
-        const bool _estop = _rt_ok && (_rt_pkg.safety_stop0_state != 0 || _rt_pkg.safety_stop1_state != 0);  // SI0/SI1
-        if(_drag){
-            if(!_prev_drag){                       // 드래그 진입 엣지 — 스프링백 목표 스냅샷
-                for(int i=0;i<6;i++) _pre_drag_cmd[i] = _jnt_position_command[i];
-            }
-            RCLCPP_WARN_THROTTLE(rclcpp::get_logger("FairinoHardwareInterface"), _skip_clk, 2000,
-                "[servo-skip] robot_state==4(드래그 모드) — ServoJ 스킵, 팔이 JTC/서보 명령을 안 따름. "
-                "드래그 미해제 의심(visual_servo 는 'no raw joint progress'로 abort 함).");
-            for(int i=0;i<6;i++) _hold_target[i] = _jnt_position_state[i];  // 옮긴 위치 추적
-            _prev_drag = true;
-            _post_drag_hold = true;
-            _servo_error_count = 0;
-            return hardware_interface::return_type::OK;   // ServoJ/복구 스킵 → 드래그와 안 싸움
-        }
-        _prev_drag = false;
+void FairinoHardwareInterface::commitDiagnostics() {
+    control_diagnostics_.sampled_at_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    control_diagnostics_.command_period_sec = servo_command_period_sec_;
+    control_diagnostics_.state_valid = rt_valid_;
+    control_diagnostics_.cancel_hold = cancel_hold_;
+    control_diagnostics_.flush_inhibit = flush_inhibit_;
+    control_diagnostics_.hard_inhibit = hard_inhibit_.load();
+    control_diagnostics_.drag_hold = _post_drag_hold;
+    control_diagnostics_.estop_hold = _post_estop_hold;
+    control_diagnostics_.flush_generation = flush_requested_.load();
+    control_diagnostics_.flush_completed_generation = flush_completed_.load();
+    control_diagnostics_.flush_result = flush_result_.load();
+    control_diagnostics_.flush_phase = static_cast<int>(flush_phase_);
+    // The timer copies this POD under the mutex, then releases it before doing
+    // any allocation, formatting or ROS publication. Never block the RT loop.
+    std::unique_lock<std::mutex> lock(diagnostics_mutex_, std::try_to_lock);
+    if (lock.owns_lock()) published_diagnostics_ = control_diagnostics_;
+}
 
-        // ── 안전정지(e-stop) anti-springback ─────────────────────────────────────
-        // e-stop(safety_stop SI0/SI1)을 ServoJ 보내기 *전에* 감지한다(반응형 error=99 가 아니라 사전
-        // 감지). 감지 즉시 StopMotion() 으로 FR5 내부 모션을 abort 해 릴리스 때 재개할 옛 궤적(A)을
-        // 없애고, 드래그와 같은 원리로 정지 위치(B)를 _hold_target 에 래치한 뒤 ServoJ 를 스킵한다
-        // (return OK — 옛 setpoint 명령이 절대 안 나감). 해제 후엔 _post_estop_hold 로 새 goal 전까지
-        // B 를 유지 → 릴리스 시 A 로 튀지 않고 B 에 머문다. 새 goal 이 오면(command 변화) 정상 복귀.
-        if(_estop){
-            if(!_prev_estop){                          // e-stop 진입 엣지 — 내부 모션 abort(재개할 A 제거)
-                _ptr_robot->StopMotion();
-            }
-            RCLCPP_WARN_THROTTLE(rclcpp::get_logger("FairinoHardwareInterface"), _skip_clk, 2000,
-                "[servo-skip] safety_stop SI0=%d SI1=%d — StopMotion+ServoJ 스킵, 팔 정지(안전정지 해제 필요; "
-                "visual_servo 는 'no raw joint progress'로 abort 함).",
-                (int)_rt_pkg.safety_stop0_state, (int)_rt_pkg.safety_stop1_state);
-            for(int i=0;i<6;i++){
-                _hold_target[i]   = _jnt_position_state[i];    // 정지 위치(B)
-                _pre_estop_cmd[i] = _jnt_position_command[i];  // JTC 현재 command — 새 goal 판정 기준
-            }
-            _prev_estop = true;
-            _post_estop_hold = true;
-            _servo_error_count = 0;
-            return hardware_interface::return_type::OK;        // ServoJ 스킵 → A 명령 안 나감
-        }
-        _prev_estop = false;
+void FairinoHardwareInterface::publishDiagnostics() {
+    DiagnosticSnapshot snapshot;
+    {
+        std::lock_guard<std::mutex> lock(diagnostics_mutex_);
+        snapshot = published_diagnostics_;
+    }
+    diagnostic_msgs::msg::DiagnosticArray array;
+    array.header.stamp = _svc_node->now();
+    diagnostic_msgs::msg::DiagnosticStatus status;
+    status.name = "fairino_hardware/control";
+    const char* robot_id = std::getenv("MF_ROBOT_ID");
+    status.hardware_id = robot_id && *robot_id ? robot_id : _controller_ip;
+    status.level = diagnostic_msgs::msg::DiagnosticStatus::OK;
+    status.message = "servo control";
+    const double sample_age_sec = (std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count() - snapshot.sampled_at_ns) * 1e-9;
+    if (!snapshot.state_valid || sample_age_sec > 0.2 || snapshot.flush_inhibit ||
+        snapshot.rpc[SERVO_RPC].rc != 0) {
+        status.level = diagnostic_msgs::msg::DiagnosticStatus::ERROR;
+        status.message = "state/servo/flush blocked";
+    } else if (snapshot.cancel_hold || snapshot.drag_hold || snapshot.estop_hold ||
+               snapshot.safety0 || snapshot.safety1 || snapshot.robot_state == 4) {
+        status.level = diagnostic_msgs::msg::DiagnosticStatus::WARN;
+        status.message = "holding or safety/drag stop";
+    }
+    const auto add = [&status](const char* key, const auto value) {
+        diagnostic_msgs::msg::KeyValue item;
+        item.key = key;
+        item.value = std::to_string(value);
+        status.values.push_back(std::move(item));
+    };
+    add("servo_command_period_sec", snapshot.command_period_sec);
+    add("cmdT_sec", snapshot.command_period_sec);
+    add("loop_period_sec", snapshot.loop_period_sec);
+    add("actual_loop_period_sec", snapshot.actual_loop_period_sec);
+    add("state_age_sec", snapshot.state_age_sec);
+    add("diagnostic_snapshot_age_sec", sample_age_sec);
+    add("write_cycles", snapshot.write_cycles);
+    add("servoJCmdNum", snapshot.servo_command_count);
+    add("target_state_error_rad", snapshot.target_state_error_rad);
+    add("queue_length", snapshot.queue_length);
+    add("flush_generation", snapshot.flush_generation);
+    add("flush_completed_generation", snapshot.flush_completed_generation);
+    add("flush_result", snapshot.flush_result);
+    add("flush_phase", snapshot.flush_phase);
+    add("cancel_hold", snapshot.cancel_hold);
+    add("flush_inhibit", snapshot.flush_inhibit);
+    add("hard_inhibit", snapshot.hard_inhibit);
+    add("post_drag_hold", snapshot.drag_hold);
+    add("post_estop_hold", snapshot.estop_hold);
+    add("robot_state", snapshot.robot_state);
+    add("safety_stop0_state", snapshot.safety0);
+    add("safety_stop1_state", snapshot.safety1);
+    add("rt_frame", snapshot.frame);
+    static constexpr const char* names[] = {
+        "state_rpc", "ServoJ", "StopMotion", "ServoMoveEnd", "MotionQueueClear",
+        "GetMotionQueueLength", "ServoMoveStart", "DragTeachSwitch", "ResetAllError"};
+    for (size_t i = 0; i < RPC_COUNT; ++i) {
+        add((std::string(names[i]) + "_rc").c_str(), snapshot.rpc[i].rc);
+        add((std::string(names[i]) + "_duration_ms").c_str(), snapshot.rpc[i].duration_ms);
+        add((std::string(names[i]) + "_calls").c_str(), snapshot.rpc[i].calls);
+    }
+    array.status.push_back(std::move(status));
+    diagnostics_pub_->publish(array);
+}
 
-        const bool _had_drag_hold = _post_drag_hold;
-        const bool _had_estop_hold = _post_estop_hold;
-        double _cmd_pre_drag_max = 0.0, _cmd_pre_estop_max = 0.0;
-        double _cmd_hold_max = 0.0, _cmd_state_max = 0.0;
-        int _worst_cmd_state_joint = 0;  // zero-based joint index for tracking diagnostics
-        for(int i=0;i<6;i++){
-            const double _cmd_state_dev = std::fabs(_jnt_position_command[i] - _jnt_position_state[i]);
-            if(_cmd_state_dev > _cmd_state_max){
-                _cmd_state_max = _cmd_state_dev;
-                _worst_cmd_state_joint = i;
-            }
-            if(_had_drag_hold || _had_estop_hold){
-                _cmd_pre_drag_max = std::max(_cmd_pre_drag_max, std::fabs(_jnt_position_command[i] - _pre_drag_cmd[i]));
-                _cmd_pre_estop_max = std::max(_cmd_pre_estop_max, std::fabs(_jnt_position_command[i] - _pre_estop_cmd[i]));
-                _cmd_hold_max = std::max(_cmd_hold_max, std::fabs(_jnt_position_command[i] - _hold_target[i]));
-            }
+void FairinoHardwareInterface::requestStopAndFlush(
+    std_srvs::srv::Trigger::Response& response, bool resume_after_stop) {
+    response.success = false;
+    if (flush_callback_busy_.exchange(true)) {
+        response.message = "stop_and_flush already waiting";
+        return;
+    }
+    if (!resume_after_stop && hard_inhibit_.load() &&
+        flush_requested_.load() == flush_completed_.load() &&
+        flush_result_.load() == static_cast<int>(FlushResult::SUCCESS)) {
+        response.success = true;
+        response.message = "motion already stopped and hard-inhibited until hardware restart";
+        flush_callback_busy_.store(false);
+        return;
+    }
+    if (resume_after_stop && hard_inhibit_.load()) {
+        response.message = "motion is hard-inhibited after an unconfirmed goal; restart hardware stack";
+        flush_callback_busy_.store(false);
+        return;
+    }
+    if (flush_requested_.load() != flush_completed_.load()) {
+        response.message = "previous stop_and_flush is still pending; motion remains blocked";
+        flush_callback_busy_.store(false);
+        return;
+    }
+    const auto deadline = std::chrono::steady_clock::now() +
+        std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+            std::chrono::duration<double>(kFlushTimeoutSec));
+    flush_deadline_ns_.store(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        deadline.time_since_epoch()).count());
+    flush_result_.store(static_cast<int>(FlushResult::PENDING));
+    flush_resume_requested_.store(resume_after_stop);
+    const uint64_t generation = flush_requested_.fetch_add(1) + 1;
+    // SDK calls are exclusively on the control thread. This background wait
+    // is bounded even if an SDK call or the controller manager itself stalls.
+    while (flush_completed_.load() < generation &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    const bool completed = flush_completed_.load() >= generation;
+    const int result = flush_result_.load();
+    response.success = completed && result == static_cast<int>(FlushResult::SUCCESS);
+    response.message = std::string(resume_after_stop ? "stop_and_flush" : "stop_and_hold") +
+        " generation=" + std::to_string(generation) +
+        (completed ? " result=" + std::to_string(result)
+                   : " timeout; completion unconfirmed, motion remains blocked");
+    flush_callback_busy_.store(false);
+}
+
+void FairinoHardwareInterface::finishFlush(FlushResult result) {
+    flush_phase_ = FlushPhase::IDLE;
+    if (result != FlushResult::SUCCESS) flush_inhibit_ = true;
+    flush_result_.store(static_cast<int>(result));
+    flush_completed_.store(flush_active_generation_);
+}
+
+bool FairinoHardwareInterface::processFlush() {
+    const auto now_ns = []() {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+    };
+    const auto expired = [&]() { return now_ns() >= flush_deadline_ns_.load(); };
+    const uint64_t requested = flush_requested_.load();
+    if (requested > flush_active_generation_) {
+        flush_active_generation_ = requested;
+        flush_resume_active_ = flush_resume_requested_.load();
+        if (!flush_resume_active_) hard_inhibit_.store(true);
+        cancel_hold_ = true;
+        flush_inhibit_ = true;
+        flush_stationary_frames_ = 0;
+        for (size_t j = 0; j < 6; ++j) {
+            _hold_target[j] = _jnt_position_state[j];
+            cancel_command_at_flush_[j] = _jnt_position_command[j];
         }
-        const double* _tgt = _jnt_position_command;
-        if(_post_drag_hold){
-            double _dev = 0.0;
-            for(int i=0;i<6;i++) _dev = std::max(_dev, std::fabs(_jnt_position_command[i]-_pre_drag_cmd[i]));
-            if(_dev < 0.005){ _tgt = _hold_target; }   // JTC 아직 옛 setpoint 홀드 → 옮긴 위치 유지
-            else { _post_drag_hold = false; }          // 새 goal 도착 → 유지 해제, 정상 복귀
+        // Best-effort stop/end/clear even if one operation fails. A request
+        // already timed out still stops stale motion, but must never restart it.
+        auto start = std::chrono::steady_clock::now();
+        const int stop_rc = _ptr_robot->StopMotion();
+        recordRpc(STOP_RPC, stop_rc, start);
+        start = std::chrono::steady_clock::now();
+        const int end_rc = _ptr_robot->ServoMoveEnd();
+        recordRpc(END_RPC, end_rc, start);
+        start = std::chrono::steady_clock::now();
+        const int clear_rc = _ptr_robot->MotionQueueClear();
+        recordRpc(CLEAR_RPC, clear_rc, start);
+        control_diagnostics_.queue_length = -1;
+        if (stop_rc || end_rc || clear_rc) finishFlush(FlushResult::RPC_ERROR);
+        else if (expired()) finishFlush(FlushResult::TIMEOUT);
+        else flush_phase_ = FlushPhase::WAIT_QUEUE;
+        return true;
+    }
+    if (flush_phase_ == FlushPhase::IDLE) return flush_inhibit_;
+    if (expired()) {
+        finishFlush(FlushResult::TIMEOUT);
+        return true;
+    }
+    if (flush_phase_ == FlushPhase::WAIT_QUEUE) {
+        int length = -1;
+        const auto start = std::chrono::steady_clock::now();
+        const int rc = _ptr_robot->GetMotionQueueLength(&length);
+        recordRpc(QUEUE_RPC, rc, start);
+        control_diagnostics_.queue_length = length;
+        if (rc || length < 0) finishFlush(FlushResult::RPC_ERROR);
+        else if (length == 0) {
+            // A zero SDK queue does not prove that the arm has stopped.
+            // Start a fresh-frame stationary window after the queue sample.
+            flush_queue_empty_frame_ = rt_snapshot_.frame_cnt;
+            flush_stationary_frame_ = flush_queue_empty_frame_;
+            flush_stationary_frames_ = 0;
+            flush_phase_ = FlushPhase::WAIT_STATIONARY;
         }
-        if(_post_estop_hold){                          // e-stop 해제 후: 새 goal 전까지 B 유지
-            double _dev = 0.0;
-            for(int i=0;i<6;i++) _dev = std::max(_dev, std::fabs(_jnt_position_command[i]-_pre_estop_cmd[i]));
-            if(_dev < 0.005){ _tgt = _hold_target; }
-            else { _post_estop_hold = false; }         // JTC 새 궤적 시작 → 해제, 정상 복귀
+        return true;
+    }
+    if (!rt_valid_) return true;
+    if (_drag_active || _drag_req.load() != 0 || rt_snapshot_.robot_state == 4 ||
+        !(rt_snapshot_.tl_dgt_input_l & 1) || rt_snapshot_.safety_stop0_state ||
+        rt_snapshot_.safety_stop1_state) {
+        finishFlush(FlushResult::UNSAFE_STATE);
+        return true;
+    }
+    if (flush_phase_ == FlushPhase::WAIT_STATIONARY) {
+        if (rt_snapshot_.frame_cnt == flush_stationary_frame_) return true;
+        flush_stationary_frame_ = rt_snapshot_.frame_cnt;
+        double max_velocity_deg_sec = 0.0;
+        bool velocity_valid = true;
+        for (double velocity : rt_snapshot_.actual_qd) {
+            velocity_valid = velocity_valid && std::isfinite(velocity);
+            max_velocity_deg_sec = std::max(max_velocity_deg_sec, std::fabs(velocity));
         }
-        if((_had_drag_hold && !_post_drag_hold) || (_had_estop_hold && !_post_estop_hold)){
-            RCLCPP_INFO(rclcpp::get_logger("FairinoHardwareInterface"),
-                "[servo-hold-release] released_drag=%d released_estop=%d post_drag_hold=%d post_estop_hold=%d "
-                "max_abs(command-pre_drag)=%.6f rad max_abs(command-pre_estop)=%.6f rad "
-                "max_abs(command-hold)=%.6f rad max_abs(command-state)=%.6f rad held_target_selected=%d",
-                (int)(_had_drag_hold && !_post_drag_hold), (int)(_had_estop_hold && !_post_estop_hold),
-                (int)_post_drag_hold, (int)_post_estop_hold, _cmd_pre_drag_max, _cmd_pre_estop_max,
-                _cmd_hold_max, _cmd_state_max, (int)(_tgt == _hold_target));
+        if (!velocity_valid) {
+            finishFlush(FlushResult::UNSAFE_STATE);
+            return true;
         }
-        if(_tgt == _hold_target){                         // post-drag/estop hold: JTC 명령 무시하고 정지자세 유지
-            RCLCPP_WARN_THROTTLE(rclcpp::get_logger("FairinoHardwareInterface"), _skip_clk, 2000,
-                "[servo-hold] ServoJ is sending held target; post_drag_hold=%d post_estop_hold=%d "
-                "max_abs(command-pre_drag)=%.6f rad max_abs(command-pre_estop)=%.6f rad "
-                "max_abs(command-hold)=%.6f rad max_abs(command-state)=%.6f rad release_threshold=0.005000 rad",
-                (int)_post_drag_hold, (int)_post_estop_hold, _cmd_pre_drag_max, _cmd_pre_estop_max,
-                _cmd_hold_max, _cmd_state_max);
-        }
-        JointPos cmd;
-        ExaxisPos extcmd{0,0,0,0};
-        double _target_state_max = 0.0;
-        for(auto j=0;j<6;j++){
-            cmd.jPos[j] = _tgt[j]/M_PI*180; //注意单位转换
-            _target_state_max = std::max(_target_state_max, std::fabs(_tgt[j] - _jnt_position_state[j]));
-        }
-        // cmdT 를 update_rate(50Hz=20ms) 에 맞춘다(2026-09-07). 옛 0.008(8ms=125Hz)은 update_rate 를
-        // 50 으로 낮출 때 안 고쳐진 잔재라, 서보가 8ms 만에 도달 후 12ms 멈춤을 반복해 **뚝뚝 끊기고**
-        // 20ms 간격 궤적 스텝을 8ms 안에 못 닿아 **ServoJ error=14** 를 냈다. 0.02 로 20ms 내내 연속 이동.
-        int returncode = _ptr_robot->ServoJ(&cmd,&extcmd,0,0,0.02,0,0);
-        if(_cmd_state_max >= 0.005 || _target_state_max >= 0.005){
-            RCLCPP_INFO_THROTTLE(rclcpp::get_logger("FairinoHardwareInterface"), _skip_clk, 2000,
-                "[servo-tracking] rc=%d post_drag_hold=%d post_estop_hold=%d held_target_selected=%d "
-                "rt_ok=%d robot_state=%d safety0=%d safety1=%d rt_frame=%d main_code=%d sub_code=%d "
-                "servoJCmdNum=%d rt_lastServoTarget_raw=%.6f rt_joint_position_deg=%.6f "
-                "max_abs(command-state)=%.6f rad max_abs(target-state)=%.6f rad "
-                "worst_command_state_joint_index=%d command=%.6f rad target=%.6f rad state=%.6f rad "
-                "write_period=%.6f s cmdT=0.020000 s",
-                returncode, (int)_post_drag_hold, (int)_post_estop_hold, (int)(_tgt == _hold_target),
-                (int)_rt_ok, _rt_ok ? (int)_rt_pkg.robot_state : -1,
-                _rt_ok ? (int)_rt_pkg.safety_stop0_state : -1, _rt_ok ? (int)_rt_pkg.safety_stop1_state : -1,
-                _rt_ok ? (int)_rt_pkg.frame_cnt : -1, _rt_ok ? _rt_pkg.main_code : -1,
-                _rt_ok ? _rt_pkg.sub_code : -1, _rt_ok ? _rt_pkg.servoJCmdNum : -1,
-                _rt_ok ? _rt_pkg.lastServoTarget[_worst_cmd_state_joint] : std::numeric_limits<double>::quiet_NaN(),
-                _rt_ok ? _rt_pkg.jt_cur_pos[_worst_cmd_state_joint] : std::numeric_limits<double>::quiet_NaN(),
-                _cmd_state_max, _target_state_max, _worst_cmd_state_joint,
-                _jnt_position_command[_worst_cmd_state_joint], _tgt[_worst_cmd_state_joint],
-                _jnt_position_state[_worst_cmd_state_joint], period.seconds());
-        }
-        if(returncode != 0){
-            _servo_error_count++;
-            if(_servo_error_count <= 3){
-                RCLCPP_WARN(rclcpp::get_logger("FairinoHardwareInterface"),
-                    "ServoJ error=%d, attempting recovery (%d)... max_abs(target-state)=%.6f rad "
-                    "post_drag_hold=%d post_estop_hold=%d held_target_selected=%d write_period=%.6f s cmdT=0.020000 s",
-                    returncode, _servo_error_count, _target_state_max, (int)_post_drag_hold,
-                    (int)_post_estop_hold, (int)(_tgt == _hold_target), period.seconds());
-                _ptr_robot->ResetAllError();
-                _ptr_robot->ServoMoveStart();
-            } else if(_servo_error_count % 500 == 0){
-                // Throttle logging after initial retries
-                RCLCPP_WARN(rclcpp::get_logger("FairinoHardwareInterface"), "ServoJ error=%d persists (count=%d)", returncode, _servo_error_count);
-            }
+        if (rt_snapshot_.robot_state == 1 &&
+            max_velocity_deg_sec <= kStoppedVelocityDegSec) {
+            ++flush_stationary_frames_;
         } else {
-            if(_servo_error_count > 0){
-                RCLCPP_INFO(rclcpp::get_logger("FairinoHardwareInterface"), "ServoJ recovered after %d errors", _servo_error_count);
+            flush_stationary_frames_ = 0;
+        }
+        if (flush_stationary_frames_ < kStoppedFramesRequired) return true;
+
+        for (size_t j = 0; j < 6; ++j) {
+            _hold_target[j] = _jnt_position_state[j];
+            cancel_command_at_flush_[j] = _jnt_position_command[j];
+        }
+        if (!flush_resume_active_) {
+            // Unknown/unterminated upstream goals may still be accepted late.
+            // Leave servo mode ended and keep the hard inhibit until restart.
+            finishFlush(FlushResult::SUCCESS);
+            return true;
+        }
+        if (expired()) {
+            finishFlush(FlushResult::TIMEOUT);
+            return true;
+        }
+        const auto start = std::chrono::steady_clock::now();
+        const int rc = _ptr_robot->ServoMoveStart();
+        recordRpc(START_RPC, rc, start);
+        if (rc) {
+            finishFlush(FlushResult::RPC_ERROR);
+        } else if (expired()) {
+            finishFlush(FlushResult::TIMEOUT);
+        } else {
+            flush_restart_frame_ = rt_snapshot_.frame_cnt;
+            flush_phase_ = FlushPhase::WAIT_RESTART_FRESH;
+        }
+        return true;
+    }
+    if (rt_snapshot_.frame_cnt == flush_restart_frame_) return true;
+    double restart_velocity_deg_sec = 0.0;
+    for (double velocity : rt_snapshot_.actual_qd) {
+        if (!std::isfinite(velocity)) {
+            finishFlush(FlushResult::UNSAFE_STATE);
+            return true;
+        }
+        restart_velocity_deg_sec = std::max(restart_velocity_deg_sec, std::fabs(velocity));
+    }
+    if (rt_snapshot_.robot_state != 1 ||
+        restart_velocity_deg_sec > kStoppedVelocityDegSec) {
+        finishFlush(FlushResult::UNSAFE_STATE);
+        return true;
+    }
+    for (size_t j = 0; j < 6; ++j) {
+        // Resync against a feedback frame sampled after ServoMoveStart.
+        _hold_target[j] = _jnt_position_state[j];
+        cancel_command_at_flush_[j] = _jnt_position_command[j];
+    }
+    if (expired()) {
+        finishFlush(FlushResult::TIMEOUT);
+        return true;
+    }
+    flush_inhibit_ = false;
+    _servo_error_count = 0;
+    finishFlush(FlushResult::SUCCESS);
+    // Never issue a ServoJ in the same cycle that completes the flush.
+    return true;
+}
+
+hardware_interface::return_type FairinoHardwareInterface::read(
+    const rclcpp::Time&, const rclcpp::Duration&) {
+    ROBOT_STATE_PKG state{};
+    const auto start = std::chrono::steady_clock::now();
+    const int rc = _ptr_robot->GetRobotRealTimeState(&state);
+    recordRpc(STATE_RPC, rc, start);
+    rt_valid_ = rc == 0;
+    for (size_t j = 0; j < 6 && rt_valid_; ++j) {
+        rt_valid_ = std::isfinite(state.jt_cur_pos[j]);
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (rt_valid_) {
+        if (!rt_frame_seen_ || state.frame_cnt != rt_snapshot_.frame_cnt) {
+            rt_frame_advanced_at_ = now;
+            rt_frame_seen_ = true;
+        }
+        control_diagnostics_.state_age_sec =
+            std::chrono::duration<double>(now - rt_frame_advanced_at_).count();
+        rt_valid_ = control_diagnostics_.state_age_sec <= kFreshStateSec;
+        if (rt_valid_) {
+            rt_snapshot_ = state;
+            for (size_t j = 0; j < 6; ++j) {
+                _jnt_position_state[j] = state.jt_cur_pos[j] * M_PI / 180.0;
             }
-            _servo_error_count = 0;
+            control_diagnostics_.servo_command_count = state.servoJCmdNum;
+            control_diagnostics_.robot_state = state.robot_state;
+            control_diagnostics_.safety0 = state.safety_stop0_state;
+            control_diagnostics_.safety1 = state.safety_stop1_state;
+            control_diagnostics_.frame = state.frame_cnt;
         }
-    }else if(_control_mode == 1){//扭矩控制模式
-        if (std::any_of(&_jnt_torque_command[0], &_jnt_torque_command[5],\
-            [](double c) { return not std::isfinite(c); })) {
-            return hardware_interface::return_type::ERROR;
-        }
-        //_ptr_robot->write(_jnt_torque_command);//注意单位转换
-    }else{
-        RCLCPP_INFO(rclcpp::get_logger("FairinoHardwareInterface"), "指令发送错误:未识别当前所处控制模式");
+    }
+    rt_available_for_write_ = rt_valid_;
+    commitDiagnostics();
+    return rt_valid_ ? hardware_interface::return_type::OK : hardware_interface::return_type::ERROR;
+}
+
+hardware_interface::return_type FairinoHardwareInterface::write(
+    const rclcpp::Time&, const rclcpp::Duration& period) {
+    const auto now = std::chrono::steady_clock::now();
+    control_diagnostics_.loop_period_sec = period.seconds();
+    control_diagnostics_.actual_loop_period_sec = last_write_at_.time_since_epoch().count() == 0
+        ? 0.0 : std::chrono::duration<double>(now - last_write_at_).count();
+    last_write_at_ = now;
+    ++control_diagnostics_.write_cycles;
+    // Stack scope guard performs only a bounded POD copy, including early exits.
+    struct CommitOnExit {
+        FairinoHardwareInterface* hardware;
+        ~CommitOnExit() { hardware->commitDiagnostics(); }
+    } commit{this};
+    const bool fresh_read = rt_valid_ && rt_available_for_write_ &&
+        std::chrono::duration<double>(now - rt_frame_advanced_at_).count() <= kFreshStateSec;
+    rt_available_for_write_ = false;
+    // Always consume a stop request even when feedback is unavailable.
+    if (!fresh_read) {
+        rt_valid_ = false;
+        if (processFlush()) return hardware_interface::return_type::OK;
         return hardware_interface::return_type::ERROR;
     }
- 
+    if (processFlush()) return hardware_interface::return_type::OK;
+    const auto& state = rt_snapshot_;
+
+    const bool button = !(state.tl_dgt_input_l & 0x01);
+    if (button && !_drag_btn_prev) _drag_req.store(1);
+    else if (!button && _drag_btn_prev) _drag_req.store(-1);
+    _drag_btn_prev = button;
+    const int drag_command = _drag_req.exchange(0);
+    if (drag_command == 1 && !_drag_active) {
+        auto start = std::chrono::steady_clock::now();
+        const int end_rc = _ptr_robot->ServoMoveEnd();
+        recordRpc(END_RPC, end_rc, start);
+        start = std::chrono::steady_clock::now();
+        const int drag_rc = _ptr_robot->DragTeachSwitch(1);
+        recordRpc(DRAG_RPC, drag_rc, start);
+        _drag_active = true;
+        _servo_error_count = 0;
+    } else if (drag_command == -1 && _drag_active) {
+        auto start = std::chrono::steady_clock::now();
+        const int drag_rc = _ptr_robot->DragTeachSwitch(0);
+        recordRpc(DRAG_RPC, drag_rc, start);
+        start = std::chrono::steady_clock::now();
+        const int start_rc = _ptr_robot->ServoMoveStart();
+        recordRpc(START_RPC, start_rc, start);
+        for (size_t j = 0; j < 6; ++j) {
+            _hold_target[j] = _jnt_position_state[j];
+            _pre_drag_cmd[j] = _jnt_position_command[j];
+        }
+        _post_drag_hold = true;
+        _drag_active = false;
+        _servo_error_count = 0;
+    }
+    if (_drag_active) {
+        std::copy_n(_jnt_position_state, 6, _hold_target);
+        return hardware_interface::return_type::OK;
+    }
+    if (_control_mode != 0) {
+        if (_control_mode == 1 && std::none_of(_jnt_torque_command, _jnt_torque_command + 6,
+                [](double value) { return !std::isfinite(value); })) {
+            return hardware_interface::return_type::OK;  // Existing reserved torque-mode no-op.
+        }
+        return hardware_interface::return_type::ERROR;
+    }
+    if (std::any_of(_jnt_position_command, _jnt_position_command + 6,
+                    [](double value) { return !std::isfinite(value); })) {
+        return hardware_interface::return_type::ERROR;
+    }
+    const bool drag = state.robot_state == 4;
+    const bool estop = state.safety_stop0_state || state.safety_stop1_state;
+    if (drag) {
+        if (!_prev_drag) std::copy_n(_jnt_position_command, 6, _pre_drag_cmd);
+        std::copy_n(_jnt_position_state, 6, _hold_target);
+        _prev_drag = true;
+        _post_drag_hold = true;
+        _servo_error_count = 0;
+        return hardware_interface::return_type::OK;
+    }
+    _prev_drag = false;
+    if (estop) {
+        if (!_prev_estop) {
+            const auto start = std::chrono::steady_clock::now();
+            const int rc = _ptr_robot->StopMotion();
+            recordRpc(STOP_RPC, rc, start);
+        }
+        std::copy_n(_jnt_position_state, 6, _hold_target);
+        std::copy_n(_jnt_position_command, 6, _pre_estop_cmd);
+        _prev_estop = true;
+        _post_estop_hold = true;
+        _servo_error_count = 0;
+        return hardware_interface::return_type::OK;
+    }
+    _prev_estop = false;
+
+    const double* target = _jnt_position_command;
+    if (_post_drag_hold) {
+        double deviation = 0.0;
+        for (size_t j = 0; j < 6; ++j) {
+            deviation = std::max(deviation, std::fabs(_jnt_position_command[j] - _pre_drag_cmd[j]));
+        }
+        if (deviation < 0.005) target = _hold_target;
+        else _post_drag_hold = false;
+    }
+    if (_post_estop_hold) {
+        double deviation = 0.0;
+        for (size_t j = 0; j < 6; ++j) {
+            deviation = std::max(deviation, std::fabs(_jnt_position_command[j] - _pre_estop_cmd[j]));
+        }
+        if (deviation < 0.005) target = _hold_target;
+        else _post_estop_hold = false;
+    }
+    if (cancel_hold_) {
+        double actual_error = 0.0, command_change = 0.0;
+        for (size_t j = 0; j < 6; ++j) {
+            actual_error = std::max(actual_error, std::fabs(_jnt_position_command[j] - _jnt_position_state[j]));
+            command_change = std::max(command_change, std::fabs(
+                _jnt_position_command[j] - cancel_command_at_flush_[j]));
+        }
+        // Hardware has no JTC goal identity. A changed command can release
+        // cancel hold only if every joint starts within 0.005 rad of fresh
+        // actual feedback. Evolving old distant setpoints remain held.
+        if (command_change > 1e-9 && actual_error <= kCancelReleaseToleranceRad) {
+            cancel_hold_ = false;
+        } else {
+            target = _hold_target;
+        }
+    }
+    JointPos command{};
+    ExaxisPos external{0, 0, 0, 0};
+    control_diagnostics_.target_state_error_rad = 0.0;
+    for (size_t j = 0; j < 6; ++j) {
+        command.jPos[j] = target[j] * 180.0 / M_PI;
+        control_diagnostics_.target_state_error_rad = std::max(
+            control_diagnostics_.target_state_error_rad,
+            std::fabs(target[j] - _jnt_position_state[j]));
+    }
+    const auto start = std::chrono::steady_clock::now();
+    const int rc = _ptr_robot->ServoJ(&command, &external, 0, 0,
+                                    static_cast<float>(servo_command_period_sec_), 0, 0);
+    recordRpc(SERVO_RPC, rc, start);
+    if (rc != 0) {
+        ++_servo_error_count;
+        if (_servo_error_count <= 3) {
+            auto recovery_start = std::chrono::steady_clock::now();
+            const int reset_rc = _ptr_robot->ResetAllError();
+            recordRpc(RESET_RPC, reset_rc, recovery_start);
+            recovery_start = std::chrono::steady_clock::now();
+            const int start_rc = _ptr_robot->ServoMoveStart();
+            recordRpc(START_RPC, start_rc, recovery_start);
+        }
+    } else {
+        _servo_error_count = 0;
+    }
     return hardware_interface::return_type::OK;
 }
-
 
 }//end namesapce
 

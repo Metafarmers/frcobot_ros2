@@ -1,5 +1,55 @@
 # FR5 서보 무진행 진단 (2026-09-10)
 
+## 2026-09-11 제어·정지 계약
+
+현재 드라이버는 50Hz 제어 설정을 유지한다. 하드웨어 파라미터
+`servo_command_period_sec`의 기본값은 `0.02`초이며, 유한한 `[0.02, 0.1]`초만
+허용한다. 0.008초(125Hz), NaN/Inf, 숫자 뒤 문자열은 activation 이전에 거부한다.
+이 파라미터는 ServoJ 보간 주기이며 controller_manager의 update_rate를 변경하지 않는다.
+
+정상 제어 주기에는 `read()`가 `GetRobotRealTimeState`를 한 번 호출한다. 여섯
+`jt_cur_pos`를 degree→rad로 변환하고, `write()`의 버튼·drag·safety 판정에도
+같은 패킷을 사용한다. 새 read 없이 재호출한 write, 비유한 관절 값, 100ms 넘게
+frame counter가 갱신되지 않은 피드백으로 ServoJ를 보내지 않는다.
+
+`/fairino_hw_control/stop_and_flush` (`std_srvs/srv/Trigger`)는 다음 순서로 처리한다.
+
+1. 서비스 callback은 atomic generation 요청을 등록하고 최대 2초 기다린다.
+2. 다음 write 경계에서 `StopMotion → ServoMoveEnd → MotionQueueClear`를 실행한다.
+3. 후속 write에서 `GetMotionQueueLength == 0`을 확인한다. 그 뒤 서로 다른 새 RT
+   frame 3개에서 `robot_state == 1`이고 모든 `actual_qd`가 0.5deg/s 이하인지 확인한다.
+4. drag 또는 safety stop이면 실패하고 송신을 차단한다. 정상 상태에서만
+   `ServoMoveStart`를 호출하고, 재시작 뒤 새 RT frame에서도 정지·안전 상태를 확인한
+   다음 성공을 응답한다. 완료한 주기에는 ServoJ를 보내지 않는다.
+
+terminal 상태를 확인하지 못한 action timeout에는
+`/fairino_hw_control/stop_and_hold`를 사용한다. 정지·큐 비움·연속 정지 확인은 같지만
+`ServoMoveStart`를 호출하지 않고 `hard_inhibit`를 재기동까지 유지한다. 따라서 늦게
+수락된 옛 goal이 actual 근처 명령을 보내도 물리 ServoJ가 재개되지 않는다.
+
+모든 SDK 호출은 제어 스레드에 남는다. SDK 오류, 큐 비움 실패, timeout 이후에는
+cancel hold와 ServoJ 송신 차단을 유지하며, 새로운 성공한 flush가 있어야 재개할 수
+있다. Callback timeout은 SDK 실행 자체의 중단을 의미하지 않는다. 동기 SDK 호출
+하나의 wall-time 상한은 보장하지 못한다. 응답은 generation과 결과를 포함한다.
+결과 코드는 `0=없음, 1=처리 중, 2=성공, 3=SDK/큐 오류, 4=timeout, 5=안전/drag 상태`다.
+
+성공한 resumable flush 뒤에도 cancel hold를 유지한다. 이후 명령이 flush 당시 명령과 달라지고,
+**여섯 관절 모두 fresh actual과 0.005rad 이내에서 시작할 때만** cancel hold를
+해제한다. 이 경로는 상위 제어기가 terminal을 확인한 실패에만 사용한다. goal 신원을
+확인할 수 없는 경로는 위 stop-and-hold로 분리해 재개 자체를 막는다.
+기존 drag/e-stop hold의 0.005rad 누적 명령 변화 해제 정책은 그대로 유지한다.
+
+`/diagnostics`의 `fairino_hardware/control`을 백그라운드 100ms timer(최대 10Hz)로
+발행한다. RT 쪽은 try_lock으로 POD만 복사하며 ROS 로그/문자열 직렬화를 하지 않는다.
+cmdT, controller period/실측 write 간격, RT frame/age, ServoJ 호출 결과·시간,
+각 제어 RPC 결과·시간·횟수, servoJCmdNum, 실제 송신 target-state 최대 오차,
+hold, `hard_inhibit`, flush generation/phase/result를 포함한다. 200ms 넘게 제어 snapshot이 없으면
+ERROR다. `queue_length`는 **flush 중 마지막 직접 조회값**이며 평시 큐 길이로
+해석하지 않는다. servoJCmdNum 역시 큐 길이가 아니다.
+
+아래 2026-09-10의 `/rosout` 로그 설명은 이전 바이너리의 관측 기록이다. 현재
+주기 진단은 `/diagnostics`를 사용하므로 이를 rosbag에 포함해야 한다.
+
 ## 확인된 현상
 
 실패 기록 `20260909_215555_0020_harvest_experiment`의 PBVS 네 번 모두 JTC desired
@@ -88,9 +138,9 @@ worst joint index는 0부터 시작한다. RT 조회 실패 시 정수는 -1, �
 2초 throttle 로그만으로 약 1초짜리 실패 구간의 지연을 재구성할 수는 없다.
 같이 기록한 desired/raw/camera와 대조해 어느 target과 RT 상태가 관측됐는지 판별한다.
 
-hold 임계값, ServoJ cmdT=0.02, SDK 호출 순서, 오류 복구 정책은 변경하지 않았다.
-기존 hold가 새 goal의 신선도를 증명하는 것은 아니다. 정지 전 궤적이 계속 바뀌면
-새 goal처럼 hold를 해제할 수 있다는 기존 한계도 테스트에서 명시한다.
+기존 drag/e-stop hold 임계값과 ServoJ cmdT=0.02는 유지한다. drag/e-stop의 명령 변화
+기반 해제에는 goal ID가 없다는 한계가 남지만, action terminal 미확인 경로는 별도의
+stop-and-hold로 물리 재개를 차단한다.
 
 ## 검증과 실기 확인
 
@@ -99,10 +149,9 @@ hold 임계값, ServoJ cmdT=0.02, SDK 호출 순서, 오류 복구 정책은 변
 버튼·서비스·펜던트·SI0·SI1 각각에서 정지 중 ServoJ 생략, 옛 목표 유지, 작은 고정 편차,
 누적 작은 편차, 현재 자세 기준 새 목표, stale 궤적 변화의 기존 동작을 확인한다.
 
-2026-09-10 검증: 격리 패키지 빌드 및 30개 gtest 통과. CMake lint, 새 테스트의
-cppcheck/clang-format, XML 검사도 통과했다. XML 스키마 다운로드는 sandbox 안에서
-실패하여 접근 권한이 있는 환경에서 재검증했다. 패키지 전체 vendor lint나 실기 검증을
-통과했다는 의미는 아니다. 기존 vendor 컴파일 경고는 남는다.
+2026-09-11 검증: 패키지 빌드 및 48개 gtest 통과. CMake lint, cppcheck, XML 검사도
+통과했다. 패키지 전체 uncrustify는 기존 vendor 파일을 포함한 스타일 차이로 실패하며,
+실기 검증을 통과했다는 의미는 아니다.
 
 workspace root에서 격리 빌드한다:
 

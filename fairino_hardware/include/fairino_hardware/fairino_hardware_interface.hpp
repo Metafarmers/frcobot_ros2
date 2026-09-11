@@ -11,7 +11,12 @@
 #include <vector>
 #include "libfairino/include/robot.h"
 #include <std_srvs/srv/set_bool.hpp>
-#include <rclcpp/executors/single_threaded_executor.hpp>
+#include <std_srvs/srv/trigger.hpp>
+#include <diagnostic_msgs/msg/diagnostic_array.hpp>
+#include <rclcpp/executors/multi_threaded_executor.hpp>
+#include <array>
+#include <chrono>
+#include <mutex>
 #include <memory>
 #include <atomic>
 #include <thread>
@@ -26,6 +31,8 @@ class FairinoHardwareInterface: public hardware_interface::SystemInterface{
 public:
   friend class FairinoHardwareInterfaceTest;
   RCLCPP_SHARED_PTR_DEFINITIONS(FairinoHardwareInterface)
+
+  ~FairinoHardwareInterface() override;
 
   FAIRINO_HARDWARE_PUBLIC
   hardware_interface::CallbackReturn on_init(const hardware_interface::HardwareInfo& info) override;
@@ -66,6 +73,74 @@ private:
   std::string _controller_ip = CONTROLLER_IP_ADDRESS;
   std::unique_ptr<FRRobot> _ptr_robot;
   int _servo_error_count = 0;
+  double servo_command_period_sec_ = 0.02;  // 50 Hz contract; never infer 125 Hz.
+  ROBOT_STATE_PKG rt_snapshot_{};  // read/write control-thread owned, not shared with callbacks
+  bool rt_valid_ = false;
+  bool rt_available_for_write_ = false;
+  bool rt_frame_seen_ = false;
+  std::chrono::steady_clock::time_point rt_frame_advanced_at_{};
+  std::chrono::steady_clock::time_point last_write_at_{};
+  static constexpr double kFreshStateSec = 0.1;
+  static constexpr double kCancelReleaseToleranceRad = 0.005;
+  static constexpr double kStoppedVelocityDegSec = 0.5;
+  static constexpr unsigned kStoppedFramesRequired = 3;
+  static constexpr double kFlushTimeoutSec = 2.0;
+  enum class FlushResult : int { NONE, PENDING, SUCCESS, RPC_ERROR, TIMEOUT, UNSAFE_STATE };
+  enum class FlushPhase : int { IDLE, WAIT_QUEUE, WAIT_STATIONARY, WAIT_RESTART_FRESH };
+  std::atomic<uint64_t> flush_requested_{0};
+  std::atomic<uint64_t> flush_completed_{0};
+  std::atomic<int> flush_result_{static_cast<int>(FlushResult::NONE)};
+  std::atomic<int64_t> flush_deadline_ns_{0};
+  std::atomic<bool> flush_callback_busy_{false};
+  std::atomic<bool> flush_resume_requested_{true};
+  std::atomic<bool> hard_inhibit_{false};
+  uint64_t flush_active_generation_ = 0;
+  FlushPhase flush_phase_ = FlushPhase::IDLE;
+  uint8_t flush_queue_empty_frame_ = 0;
+  uint8_t flush_stationary_frame_ = 0;
+  uint8_t flush_restart_frame_ = 0;
+  unsigned flush_stationary_frames_ = 0;
+  bool flush_resume_active_ = true;
+  bool cancel_hold_ = false;
+  bool flush_inhibit_ = false;
+  double cancel_command_at_flush_[6]{};
+  enum RpcIndex : size_t { STATE_RPC, SERVO_RPC, STOP_RPC, END_RPC, CLEAR_RPC,
+                          QUEUE_RPC, START_RPC, DRAG_RPC, RESET_RPC, RPC_COUNT };
+  struct RpcSample { int rc = 0; double duration_ms = 0.0; uint64_t calls = 0; };
+  struct DiagnosticSnapshot {
+    std::array<RpcSample, RPC_COUNT> rpc{};
+    double command_period_sec = 0.02;
+    double loop_period_sec = 0.0;
+    double actual_loop_period_sec = 0.0;
+    double state_age_sec = 0.0;
+    double target_state_error_rad = 0.0;
+    int64_t sampled_at_ns = 0;
+    uint64_t write_cycles = 0;
+    uint64_t flush_generation = 0;
+    uint64_t flush_completed_generation = 0;
+    int flush_result = 0;
+    int flush_phase = 0;
+    int queue_length = -1;
+    int servo_command_count = 0;
+    int robot_state = 0;
+    int safety0 = 0;
+    int safety1 = 0;
+    int frame = 0;
+    bool state_valid = false;
+    bool cancel_hold = false;
+    bool flush_inhibit = false;
+    bool hard_inhibit = false;
+    bool drag_hold = false;
+    bool estop_hold = false;
+  } control_diagnostics_, published_diagnostics_;
+  std::mutex diagnostics_mutex_;  // RT uses try_lock; serialization happens only in timer.
+  void recordRpc(RpcIndex index, int rc, std::chrono::steady_clock::time_point start);
+  void commitDiagnostics();
+  void publishDiagnostics();
+  void requestStopAndFlush(std_srvs::srv::Trigger::Response& response, bool resume_after_stop);
+  bool processFlush();  // true: this write boundary must send no ServoJ
+  void finishFlush(FlushResult result);
+  void stopServiceThread();
   // ★손교시 SW 언락(전원재시작 불필요): ~/set_drag_teach(SetBool) → DragTeachSwitch 토글.
   //   ★서비스 spin 은 **별도 백그라운드 스레드**(_svc_exec)에서 돈다 — write()(50Hz 실시간)에서
   //   spin_some 을 부르면 매 사이클 executor 를 생성·파괴해 ServoJ 타이밍에 지터를 준다(뚝뚝 끊김·
@@ -73,7 +148,12 @@ private:
   //   호출한다(SDK 는 write 스레드 단독 → 스레드안전). 드래그 ON → robot_state==4 → 기존 공존이 ServoJ 스킵.
   std::shared_ptr<rclcpp::Node> _svc_node;
   rclcpp::Service<std_srvs::srv::SetBool>::SharedPtr _drag_srv;
-  std::shared_ptr<rclcpp::executors::SingleThreadedExecutor> _svc_exec;  // 서비스 전용 executor(백그라운드)
+  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr flush_srv_;
+  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr stop_hold_srv_;
+  rclcpp::CallbackGroup::SharedPtr flush_callback_group_;
+  rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr diagnostics_pub_;
+  rclcpp::TimerBase::SharedPtr diagnostics_timer_;
+  std::shared_ptr<rclcpp::executors::MultiThreadedExecutor> _svc_exec;
   std::thread _svc_spin_thread;                                          // _svc_exec->spin() 스레드
   std::atomic<int> _drag_req{0};   // 1=드래그ON 요청, -1=OFF, 0=없음(콜백=백그라운드 세팅, write 가 소비)
   bool _drag_active = false;  // 드래그모드 진행중(ServoMoveEnd+DragTeachSwitch) — ServoJ 전면 스킵

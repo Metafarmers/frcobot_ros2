@@ -18,6 +18,7 @@ find_package(pluginlib REQUIRED)
 find_package(rclcpp_lifecycle REQUIRED)
 find_package(fairino_msgs REQUIRED)
 find_package(std_srvs REQUIRED)
+find_package(diagnostic_msgs REQUIRED)
 
 
 #set variable
@@ -40,8 +41,8 @@ file(CREATE_LINK
 add_executable(ros2_cmd_server ${SRC_DIR})
 add_executable(srv_test_client ${EXP_SRC_DIR})
 add_library(
-  fairino_hardware 
-  SHARED 
+  fairino_hardware
+  SHARED
   ./src/fairino_hardware_interface.cpp
 )
 
@@ -50,12 +51,12 @@ add_library(
 
 
 #add headfile source
-target_include_directories(ros2_cmd_server PUBLIC 
-${CMAKE_CURRENT_SOURCE_DIR}/include/ 
+target_include_directories(ros2_cmd_server PUBLIC
+${CMAKE_CURRENT_SOURCE_DIR}/include/
 ${CMAKE_CURRENT_SOURCE_DIR}/)
 
 target_include_directories(srv_test_client PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/examples/include)
-target_include_directories(fairino_hardware PUBLIC 
+target_include_directories(fairino_hardware PUBLIC
 $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
 $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/>
 $<INSTALL_INTERFACE:include/fairino_hardware>
@@ -73,6 +74,7 @@ ament_target_dependencies(fairino_hardware
   fairino_msgs
   rclcpp_lifecycle
   std_srvs
+  diagnostic_msgs
 )
 
 
@@ -135,7 +137,7 @@ if(BUILD_TESTING)
     ${CMAKE_CURRENT_SOURCE_DIR}
   )
   ament_target_dependencies(test_write_hold
-    hardware_interface pluginlib rclcpp rclcpp_lifecycle std_srvs
+    hardware_interface pluginlib rclcpp rclcpp_lifecycle std_srvs diagnostic_msgs
   )
   # the following line skips the linter which checks for copyrights
   # comment the line when a copyright and license is added to all source files
