@@ -10,6 +10,11 @@
 #include "visibility_control.h"
 #include <vector>
 #include "libfairino/include/robot.h"
+#include <std_srvs/srv/set_bool.hpp>
+#include <rclcpp/executors/single_threaded_executor.hpp>
+#include <memory>
+#include <atomic>
+#include <thread>
 
 
 #define CONTROLLER_IP_ADDRESS "192.168.50.101"
@@ -19,6 +24,7 @@ namespace fairino_hardware
 
 class FairinoHardwareInterface: public hardware_interface::SystemInterface{
 public:
+  friend class FairinoHardwareInterfaceTest;
   RCLCPP_SHARED_PTR_DEFINITIONS(FairinoHardwareInterface)
 
   FAIRINO_HARDWARE_PUBLIC
@@ -60,6 +66,20 @@ private:
   std::string _controller_ip = CONTROLLER_IP_ADDRESS;
   std::unique_ptr<FRRobot> _ptr_robot;
   int _servo_error_count = 0;
+  // ★손교시 SW 언락(전원재시작 불필요): ~/set_drag_teach(SetBool) → DragTeachSwitch 토글.
+  //   ★서비스 spin 은 **별도 백그라운드 스레드**(_svc_exec)에서 돈다 — write()(50Hz 실시간)에서
+  //   spin_some 을 부르면 매 사이클 executor 를 생성·파괴해 ServoJ 타이밍에 지터를 준다(뚝뚝 끊김·
+  //   심하면 컨트롤러 fault). 콜백은 원자변수 _drag_req 만 세팅하고, write() 는 그걸 읽어 SDK 를
+  //   호출한다(SDK 는 write 스레드 단독 → 스레드안전). 드래그 ON → robot_state==4 → 기존 공존이 ServoJ 스킵.
+  std::shared_ptr<rclcpp::Node> _svc_node;
+  rclcpp::Service<std_srvs::srv::SetBool>::SharedPtr _drag_srv;
+  std::shared_ptr<rclcpp::executors::SingleThreadedExecutor> _svc_exec;  // 서비스 전용 executor(백그라운드)
+  std::thread _svc_spin_thread;                                          // _svc_exec->spin() 스레드
+  std::atomic<int> _drag_req{0};   // 1=드래그ON 요청, -1=OFF, 0=없음(콜백=백그라운드 세팅, write 가 소비)
+  bool _drag_active = false;  // 드래그모드 진행중(ServoMoveEnd+DragTeachSwitch) — ServoJ 전면 스킵
+  // ★플랜지 드래그 버튼 hold-to-drag(사용자 2026-09-09): tl_dgt_input_l bit0(active-LOW: 눌림=0)이
+  //   눌린 동안 드래그, 떼면 해제. write() 상단에서 엣지 감지해 _drag_req 세팅(서비스와 공존).
+  bool _drag_btn_prev = false;  // 직전 사이클 버튼 눌림 여부(엣지 검출)
   // 손 티칭(펜던트 DRAG) 공존 상태 — write() 에서 사용.
   // 드래그 중(robot_state==4)엔 ServoJ/복구를 스킵하고, 종료 후엔 새 goal 전까지 옮긴 위치를 유지해
   // JTC 의 옛 홀드 setpoint 로의 스프링백을 막는다.

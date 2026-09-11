@@ -17,6 +17,7 @@ find_package(hardware_interface REQUIRED)
 find_package(pluginlib REQUIRED)
 find_package(rclcpp_lifecycle REQUIRED)
 find_package(fairino_msgs REQUIRED)
+find_package(std_srvs REQUIRED)
 
 
 #set variable
@@ -65,12 +66,13 @@ target_link_libraries(fairino_hardware ${CMAKE_CURRENT_SOURCE_DIR}/libfairino/li
 #add dependencies
 ament_target_dependencies(ros2_cmd_server rclcpp fairino_msgs)
 ament_target_dependencies(srv_test_client rclcpp fairino_msgs)
-ament_target_dependencies(fairino_hardware 
+ament_target_dependencies(fairino_hardware
   hardware_interface
   pluginlib
   rclcpp
   fairino_msgs
-  rclcpp_lifecycle 
+  rclcpp_lifecycle
+  std_srvs
 )
 
 
@@ -122,6 +124,19 @@ if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)
   find_package(ament_cmake_gmock REQUIRED)
   find_package(hardware_interface REQUIRED)
+  # Compile the real write() path against test-only SDK symbols. Deliberately
+  # omit fairino_hardware/libfairino linkage so tests cannot connect to a robot.
+  ament_add_gmock(test_write_hold
+    test/test_write_hold.cpp
+    src/fairino_hardware_interface.cpp
+  )
+  target_include_directories(test_write_hold PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}
+  )
+  ament_target_dependencies(test_write_hold
+    hardware_interface pluginlib rclcpp rclcpp_lifecycle std_srvs
+  )
   # the following line skips the linter which checks for copyrights
   # comment the line when a copyright and license is added to all source files
   set(ament_cmake_copyright_FOUND TRUE)
