@@ -1,5 +1,45 @@
 # FR5 서보 무진행 진단 (2026-09-10)
 
+## 2026-11-05 DI0 오인·드래그 전환 실패 수정
+
+일반 플랜지 DI0은 기본적으로 손교시 버튼이 아니다. 자동 감지는 기본 OFF이며,
+해당 입력에 active-LOW 버튼이 실제로 배선된 장치만 ros2_control 하드웨어 설정에
+`<param name="flange_drag_button_enabled">true</param>`를 명시한다.
+허용값은 `true`/`false`/`1`/`0`이다. 명시적인 `set_drag_teach` 서비스와
+펜던트의 실제 drag 상태 감시는 이 설정과 무관하게 유지한다.
+
+물리 안전정지 입력은 드래그 모드보다 먼저 처리한다. 정지 중에는 새 drag ON 요청을
+버리고 OFF 요청만 보존한다. `ServoMoveEnd`, `DragTeachSwitch`, `ServoMoveStart`가
+성공한 순서까지만 상태를 변경하며, 실패 뒤에는 기존 stop-only 경로로 정지·큐 비움·새 RT의
+정지 확인을 시도한다. ServoJ는 차단하고 하드웨어 재기동까지
+inhibit를 유지한다. 드래그 진입 실패를 성공한 active 상태로 기록하지 않는다.
+
+`/diagnostics`의 `drag_active`, `drag_transition_failed`, `flange_drag_button_enabled`,
+`raw_tool_di`, `controller_main_error`, `controller_sub_error`로 모드와 원인을 구분한다.
+모드 전환 실패는 ERROR로 표시한다. 이번 변경은 물리 SI 안전정지 입력을 우회하지 않는다.
+기존 activation은 ResetAllError·RobotEnable·ServoMoveStart를 호출하므로 재기동은
+해당 입력과 실제 오류가 정상인지 확인하며 수행한다.
+
+## 2026-11-05 유지 목표 중복 전송 제거
+
+`write()`는 마지막으로 성공한 ServoJ와 여섯 관절 목표가 정확히 같으면 재전송하지 않는다.
+FIFO 모델에서 다음 Home/복귀 궤적을 지연시킨 중복 유지점 전송 경로를 제거한다.
+변경된 목표는 크기가 작아도 모두 전송하며, fresh RT·drag·안전정지 검사는 매 주기 유지한다.
+50Hz 제어 주기, cmdT=0.02초와 상위 관절 허용 오차는 변경하지 않는다.
+
+활성화·비활성화·Servo 모드 재시작·정지/flush·피드백/SDK 오류에는 마지막 전송 기록을
+무효화한다. 이후 첫 목표는 이전과 같아도 다시 전송하고, 실패한 ServoJ를 성공한 목표로
+기록하지 않는다. cancel/drag/e-stop의 기존 hold 해제 조건은 유지한다.
+
+진단의 `rt_motion_queue_length`는 최신 유효 RT packet의 `mc_queue_len`이며,
+`duplicate_servo_targets_skipped`는 생략한 동일 목표의 누적 횟수다. 기존 `queue_length`는
+여전히 flush 중 마지막 직접 조회값이다. 세 값을 구분해서 해석한다.
+
+로봇 없는 재현은 실제 `write()`와 50Hz FIFO 수신 모델을 연결한다. 기존 경로는 유지점
+255개 뒤 Home 목표가 5초 추가 대기 뒤에도 0.02rad 남아 1도 허용 오차를 넘었다.
+이 테스트는 SDK 수신 모델이며, 실제 컨트롤러의 지연 원인 전체와 실기 성공을 증명하지 않는다.
+적용 후 큐·송신 횟수 및 Home/복귀의 실제 도달은 실기 재시험에서 확인한다.
+
 ## 2026-09-11 제어·정지 계약
 
 현재 드라이버는 50Hz 제어 설정을 유지한다. 하드웨어 파라미터

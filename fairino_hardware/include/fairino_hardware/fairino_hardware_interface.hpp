@@ -74,6 +74,8 @@ private:
   std::unique_ptr<FRRobot> _ptr_robot;
   int _servo_error_count = 0;
   double servo_command_period_sec_ = 0.02;  // 50 Hz contract; never infer 125 Hz.
+  std::array<double, 6> last_servo_target_{};
+  bool last_servo_target_valid_ = false;
   ROBOT_STATE_PKG rt_snapshot_{};  // read/write control-thread owned, not shared with callbacks
   bool rt_valid_ = false;
   bool rt_available_for_write_ = false;
@@ -121,6 +123,8 @@ private:
     int flush_result = 0;
     int flush_phase = 0;
     int queue_length = -1;
+    int rt_motion_queue_length = -1;
+    uint64_t duplicate_servo_targets_skipped = 0;
     int servo_command_count = 0;
     int robot_state = 0;
     int safety0 = 0;
@@ -132,6 +136,12 @@ private:
     bool hard_inhibit = false;
     bool drag_hold = false;
     bool estop_hold = false;
+    bool drag_active = false;
+    bool drag_transition_failed = false;
+    bool flange_drag_button_enabled = false;
+    int raw_tool_di = 0;
+    int main_error = 0;
+    int sub_error = 0;
   } control_diagnostics_, published_diagnostics_;
   std::mutex diagnostics_mutex_;  // RT uses try_lock; serialization happens only in timer.
   void recordRpc(RpcIndex index, int rc, std::chrono::steady_clock::time_point start);
@@ -157,6 +167,9 @@ private:
   std::thread _svc_spin_thread;                                          // _svc_exec->spin() 스레드
   std::atomic<int> _drag_req{0};   // 1=드래그ON 요청, -1=OFF, 0=없음(콜백=백그라운드 세팅, write 가 소비)
   bool _drag_active = false;  // 드래그모드 진행중(ServoMoveEnd+DragTeachSwitch) — ServoJ 전면 스킵
+  bool flange_drag_button_enabled_ = false;
+  bool drag_transition_failed_ = false;
+  // Opt-in only: 일반 DI0을 버튼으로 단정하지 않는다. 실제 active-LOW 버튼 배선 장치에서만 사용한다.
   // ★플랜지 드래그 버튼 hold-to-drag(사용자 2026-09-09): tl_dgt_input_l bit0(active-LOW: 눌림=0)이
   //   눌린 동안 드래그, 떼면 해제. write() 상단에서 엣지 감지해 _drag_req 세팅(서비스와 공존).
   bool _drag_btn_prev = false;  // 직전 사이클 버튼 눌림 여부(엣지 검출)

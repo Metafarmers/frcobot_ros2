@@ -37,6 +37,7 @@ struct SdkState {
   int clear_result = 0;
   int queue_result = 0;
   int start_result = 0;
+  int drag_result = 0;
   int queue_length = 0;
   int state_calls = 0;
   int clear_calls = 0;
@@ -73,7 +74,7 @@ errno_t FRRobot::ServoJ(JointPos* joints, ExaxisPos*, float, float,
 
 errno_t FRRobot::DragTeachSwitch(uint8_t state) {
   fairino_hardware::test::sdk.drag_requests.push_back(state);
-  return 0;
+  return fairino_hardware::test::sdk.drag_result;
 }
 
 errno_t FRRobot::StopMotion() {
@@ -231,7 +232,7 @@ class FairinoHardwareInterfaceTest
     hardware_->requestStopAndFlush(response, false);
     return response;
   }
-  bool initPeriod(const std::string& value) {
+  bool initPeriod(const std::string& value, const std::string& button = "") {
     hardware_interface::HardwareInfo info;
     for (int j = 0; j < 6; ++j) {
       hardware_interface::ComponentInfo joint;
@@ -243,9 +244,17 @@ class FairinoHardwareInterfaceTest
       info.joints.push_back(joint);
     }
     if (!value.empty()) info.hardware_parameters["servo_command_period_sec"] = value;
+    if (!button.empty()) info.hardware_parameters["flange_drag_button_enabled"] = button;
     return hardware_->on_init(info) == hardware_interface::CallbackReturn::SUCCESS;
   }
   auto diagnostics() const { return hardware_->published_diagnostics_; }
+  void requestDrag(bool enable) { hardware_->_drag_req.store(enable ? 1 : -1); }
+  bool dragActive() const { return hardware_->_drag_active; }
+  void latchHardInhibit() { hardware_->hard_inhibit_.store(true); }
+  void requestResumableFlush() {
+    hardware_->flush_resume_requested_.store(true);
+    requestFlush();
+  }
 
   bool isEstop() const {
     return GetParam() == StopSource::SI0 || GetParam() == StopSource::SI1;
@@ -258,6 +267,7 @@ class FairinoHardwareInterfaceTest
   void beginStop() {
     switch (GetParam()) {
       case StopSource::FLANGE_BUTTON:
+        hardware_->flange_drag_button_enabled_ = true;
         test::sdk.state.tl_dgt_input_l = 0;
         break;
       case StopSource::DRAG_SERVICE:
@@ -339,6 +349,214 @@ TEST_F(FairinoHardwareInterfaceTest, ReadUsesOneStateRpcAndWriteReusesTheSnapsho
   for (size_t j = 0; j < actual.size(); ++j) EXPECT_NEAR(actual[j], displaced_[j], 1e-12);
   EXPECT_EQ(writeOnly(), hardware_interface::return_type::ERROR);
   EXPECT_EQ(test::sdk.servo_commands.size(), 1u);
+}
+
+TEST_F(FairinoHardwareInterfaceTest, GeneralToolDiZeroIsNotADragButtonByDefault) {
+  test::sdk.state.tl_dgt_input_l = 0;
+  writeCycle();
+  EXPECT_TRUE(test::sdk.drag_requests.empty());
+  EXPECT_EQ(test::sdk.servo_end_calls, 0);
+  EXPECT_FALSE(dragActive());
+}
+
+TEST_F(FairinoHardwareInterfaceTest, FailedServoEndCannotEnterDrag) {
+  test::sdk.end_result = 99;
+  requestDrag(true);
+  writeCycle();
+  EXPECT_FALSE(dragActive());
+  EXPECT_TRUE(test::sdk.drag_requests.empty());
+  EXPECT_TRUE(test::sdk.servo_commands.empty());
+  EXPECT_TRUE(hardInhibited());
+  EXPECT_EQ(test::sdk.stop_calls, 1);
+  EXPECT_EQ(test::sdk.clear_calls, 1);
+}
+
+TEST_F(FairinoHardwareInterfaceTest, SafetyAfterFailedModeStillSendsPhysicalStop) {
+  test::sdk.end_result = -1;
+  requestDrag(true);
+  writeCycle();
+  const int stopped_before = test::sdk.stop_calls;
+  test::sdk.state.safety_stop0_state = 1;
+  writeCycle();
+  EXPECT_EQ(test::sdk.stop_calls, stopped_before + 1);
+  EXPECT_TRUE(test::sdk.servo_commands.empty());
+}
+
+TEST_F(FairinoHardwareInterfaceTest, PendingResumableFlushCannotRearmModeFault) {
+  test::sdk.end_result = -1;
+  requestDrag(true);
+  writeCycle();
+  test::sdk.end_result = 0;
+  requestResumableFlush();
+  for (int cycle = 0; cycle < 10; ++cycle) writeCycle();
+  EXPECT_TRUE(hardInhibited());
+  EXPECT_EQ(test::sdk.servo_start_calls, 0);
+  EXPECT_TRUE(test::sdk.servo_commands.empty());
+}
+
+TEST_F(FairinoHardwareInterfaceTest, FailedDragEnableCannotPretendModeChanged) {
+  test::sdk.drag_result = -1;
+  requestDrag(true);
+  writeCycle();
+  EXPECT_FALSE(dragActive());
+  EXPECT_TRUE(hardInhibited());
+  setCommand(displaced_);
+  writeCycle();
+  EXPECT_TRUE(test::sdk.servo_commands.empty());
+  EXPECT_EQ(test::sdk.servo_start_calls, 0);
+}
+
+TEST_F(FairinoHardwareInterfaceTest, FailedDragDisableCannotRestartServo) {
+  requestDrag(true);
+  writeCycle();
+  ASSERT_TRUE(dragActive());
+  test::sdk.drag_result = -1;
+  requestDrag(false);
+  writeCycle();
+  EXPECT_TRUE(dragActive());
+  EXPECT_EQ(test::sdk.servo_start_calls, 0);
+  EXPECT_TRUE(hardInhibited());
+  EXPECT_TRUE(test::sdk.servo_commands.empty());
+}
+
+TEST_F(FairinoHardwareInterfaceTest, FailedServoRestartCannotReleaseDragHold) {
+  requestDrag(true);
+  writeCycle();
+  test::sdk.start_result = 99;
+  requestDrag(false);
+  writeCycle();
+  EXPECT_TRUE(hardInhibited());
+  setCommand(displaced_);
+  writeCycle();
+  EXPECT_TRUE(test::sdk.servo_commands.empty());
+}
+
+TEST_F(FairinoHardwareInterfaceTest, SafetyStopPreemptsDragRequests) {
+  test::sdk.state.safety_stop0_state = 1;
+  requestDrag(true);
+  writeCycle();
+  EXPECT_EQ(test::sdk.stop_calls, 1);
+  EXPECT_TRUE(test::sdk.drag_requests.empty());
+  EXPECT_EQ(test::sdk.servo_start_calls, 0);
+  EXPECT_TRUE(test::sdk.servo_commands.empty());
+  test::sdk.state.safety_stop0_state = 0;
+  writeCycle();
+  EXPECT_TRUE(test::sdk.drag_requests.empty());
+}
+
+TEST_F(FairinoHardwareInterfaceTest, GeneralToolDiDoesNotPreventConfirmedStop) {
+  test::sdk.state.tl_dgt_input_l = 0;
+  requestFlush();
+  for (int cycle = 0; cycle < 10 && !flushSucceeded(); ++cycle) writeCycle();
+  EXPECT_TRUE(flushSucceeded());
+}
+
+TEST_F(FairinoHardwareInterfaceTest, WiredFlangeButtonRequiresExplicitOptIn) {
+  ASSERT_TRUE(initPeriod("", "true"));
+  test::sdk.state.tl_dgt_input_l = 0;
+  writeCycle();
+  ASSERT_EQ(test::sdk.drag_requests, std::vector<uint8_t>{1});
+  EXPECT_TRUE(dragActive());
+  test::sdk.state.tl_dgt_input_l = 1;
+  writeCycle();
+  EXPECT_EQ(test::sdk.drag_requests, (std::vector<uint8_t>{1, 0}));
+  EXPECT_FALSE(dragActive());
+}
+
+TEST_F(FairinoHardwareInterfaceTest, ExplicitlyWiredPressedButtonStillBlocksFlush) {
+  ASSERT_TRUE(initPeriod("", "1"));
+  test::sdk.state.tl_dgt_input_l = 0;
+  requestFlush();
+  for (int cycle = 0; cycle < 8; ++cycle) writeCycle();
+  EXPECT_FALSE(flushSucceeded());
+  EXPECT_TRUE(flushBlocked());
+  EXPECT_EQ(test::sdk.servo_start_calls, 0);
+}
+
+TEST_F(FairinoHardwareInterfaceTest, InvalidFlangeButtonSettingIsRejected) {
+  for (const std::string value : {"yes", "automatic", "2"}) {
+    EXPECT_FALSE(initPeriod("", value));
+  }
+  EXPECT_TRUE(initPeriod("", "false"));
+  EXPECT_TRUE(initPeriod("", "0"));
+}
+
+TEST_F(FairinoHardwareInterfaceTest, SafetyStopDefersDragOffWithoutRestartingMotion) {
+  requestDrag(true);
+  writeCycle();
+  ASSERT_TRUE(dragActive());
+  test::sdk.state.safety_stop1_state = 1;
+  requestDrag(false);
+  writeCycle();
+  EXPECT_EQ(test::sdk.stop_calls, 1);
+  EXPECT_EQ(test::sdk.drag_requests, std::vector<uint8_t>{1});
+  EXPECT_EQ(test::sdk.servo_start_calls, 0);
+  test::sdk.state.safety_stop1_state = 0;
+  writeCycle();
+  EXPECT_EQ(test::sdk.drag_requests, (std::vector<uint8_t>{1, 0}));
+  EXPECT_FALSE(dragActive());
+}
+
+TEST_F(FairinoHardwareInterfaceTest, UnchangedHoldDoesNotQueueRepeatedServoTargets) {
+  for (int cycle = 0; cycle < 255; ++cycle) writeCycle();
+  ASSERT_EQ(test::sdk.servo_commands.size(), 1u);
+  expectTarget(Joints{});
+}
+
+TEST_F(FairinoHardwareInterfaceTest, IdleQueueCannotDelayHomeBeyondFiveSecondSettlingBudget) {
+  // Replay the observed 255-entry backlog with a FIFO consumer at 50 Hz.
+  // The actual write() emits the points; only the SDK/robot receiver is modeled.
+  for (int cycle = 0; cycle < 255; ++cycle) writeCycle();
+  size_t consumed = 0;
+  Joints actual{};
+  constexpr double goal = 0.1;
+  for (int cycle = 1; cycle <= 25 + 250; ++cycle) {
+    Joints command{};
+    command[5] = goal * std::min(cycle, 25) / 25;
+    setCommand(command);
+    writeCycle();
+    if (consumed < test::sdk.servo_commands.size()) {
+      const auto& next = test::sdk.servo_commands[consumed++];
+      for (size_t j = 0; j < actual.size(); ++j) {
+        actual[j] = next.jPos[j] * std::acos(-1.0) / 180.0;
+      }
+    }
+    setMeasured(actual);
+  }
+  EXPECT_LE(std::fabs(goal - actual[5]), std::acos(-1.0) / 180.0);
+  EXPECT_EQ(consumed, test::sdk.servo_commands.size());
+}
+
+TEST_F(FairinoHardwareInterfaceTest, EveryChangedTargetIsSentWithoutADeadband) {
+  for (int cycle = 0; cycle < 20; ++cycle) {
+    Joints command{};
+    command[5] = cycle * 1e-8;
+    setCommand(command);
+    writeCycle();
+  }
+  EXPECT_EQ(test::sdk.servo_commands.size(), 20u);
+}
+
+TEST_F(FairinoHardwareInterfaceTest, FailedSendCannotSuppressRetryOfTheSameTarget) {
+  test::sdk.servo_result = 14;
+  writeCycle();
+  test::sdk.servo_result = 0;
+  writeCycle();
+  ASSERT_EQ(test::sdk.servo_commands.size(), 2u);
+  writeCycle();
+  EXPECT_EQ(test::sdk.servo_commands.size(), 2u);
+}
+
+TEST_F(FairinoHardwareInterfaceTest, SuccessfulFlushResendsItsFirstUnchangedHoldTarget) {
+  writeCycle();
+  requestFlush();
+  for (int cycle = 0; cycle < 10 && !flushSucceeded(); ++cycle) writeCycle();
+  ASSERT_TRUE(flushSucceeded());
+  ASSERT_EQ(test::sdk.servo_commands.size(), 1u);
+  writeCycle();
+  ASSERT_EQ(test::sdk.servo_commands.size(), 2u);
+  writeCycle();
+  EXPECT_EQ(test::sdk.servo_commands.size(), 2u);
 }
 
 TEST_F(FairinoHardwareInterfaceTest, InvalidSixthJointAndStaleFrameBlockServo) {
@@ -528,6 +746,23 @@ TEST_F(FairinoHardwareInterfaceTest, FlushServiceWaitsForControlThreadCompletion
   EXPECT_TRUE(response.get().success);
 }
 
+TEST_F(FairinoHardwareInterfaceTest, ResumableFlushReportsFailureWhenHardInhibitedAfterAdmission) {
+  auto response = callFlushService();
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+  while (flushRequested() == 0 && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::yield();
+  }
+  ASSERT_EQ(flushRequested(), 1u);
+  latchHardInhibit();
+  for (int i = 0; i < 6; ++i) writeCycle();
+  const auto result = response.get();
+  EXPECT_TRUE(flushSucceeded());
+  EXPECT_FALSE(result.success);
+  EXPECT_NE(result.message.find("restart hardware stack"), std::string::npos);
+  EXPECT_EQ(test::sdk.servo_start_calls, 0);
+  EXPECT_TRUE(test::sdk.servo_commands.empty());
+}
+
 TEST_F(FairinoHardwareInterfaceTest, MovingFeedbackCannotCompleteFlush) {
   requestFlush();
   writeCycle();
@@ -642,7 +877,8 @@ TEST_P(FairinoHardwareInterfaceTest, OldCommandRetainsMovedPoseAfterRelease) {
     EXPECT_TRUE(isHolding());
     expectTarget(displaced_);
   }
-  EXPECT_EQ(test::sdk.servo_commands.size(), first_command_count + 3);
+  // The already-sent safe hold target remains selected without requeueing it.
+  EXPECT_EQ(test::sdk.servo_commands.size(), first_command_count);
   EXPECT_EQ(test::sdk.stop_calls, isEstop() ? 1 : 0);
 }
 

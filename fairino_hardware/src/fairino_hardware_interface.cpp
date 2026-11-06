@@ -24,10 +24,23 @@ void FairinoHardwareInterface::stopServiceThread() {
 }
 
 hardware_interface::CallbackReturn FairinoHardwareInterface::on_init(const hardware_interface::HardwareInfo& sysinfo){
+    last_servo_target_valid_ = false;
     if (hardware_interface::SystemInterface::on_init(sysinfo) != hardware_interface::CallbackReturn::SUCCESS) {
         return hardware_interface::CallbackReturn::ERROR;
     }
     info_ = sysinfo;//info_是父类中定义的变量
+
+    flange_drag_button_enabled_ = false;
+    const auto button_parameter = info_.hardware_parameters.find("flange_drag_button_enabled");
+    if (button_parameter != info_.hardware_parameters.end()) {
+        const auto& value = button_parameter->second;
+        if (value == "true" || value == "1") flange_drag_button_enabled_ = true;
+        else if (value != "false" && value != "0") {
+            RCLCPP_ERROR(rclcpp::get_logger("FairinoHardwareInterface"),
+                         "flange_drag_button_enabled must be true/false or 1/0");
+            return hardware_interface::CallbackReturn::ERROR;
+        }
+    }
 
     servo_command_period_sec_ = 0.02;
     const auto period_parameter = info_.hardware_parameters.find("servo_command_period_sec");
@@ -209,6 +222,7 @@ hardware_interface::CallbackReturn FairinoHardwareInterface::on_activate(const r
         rt_available_for_write_ = false;
         rt_frame_seen_ = false;
         last_write_at_ = {};
+        last_servo_target_valid_ = false;
         flush_phase_ = FlushPhase::IDLE;
         flush_active_generation_ = 0;
         flush_requested_.store(0);
@@ -218,6 +232,10 @@ hardware_interface::CallbackReturn FairinoHardwareInterface::on_activate(const r
         hard_inhibit_.store(false);
         cancel_hold_ = false;
         flush_inhibit_ = false;
+        drag_transition_failed_ = false;
+        _drag_active = false;
+        _drag_req.store(0);
+        _drag_btn_prev = false;
         RCLCPP_INFO(rclcpp::get_logger("FairinoHardwareInterface"),"初始指令位置: %f,%f,%f,%f,%f,%f",_jnt_position_command[0],\
         _jnt_position_command[1],_jnt_position_command[2],_jnt_position_command[3],_jnt_position_command[4],_jnt_position_command[5]);
         // Enter servo mode before ServoJ commands
@@ -271,6 +289,7 @@ hardware_interface::CallbackReturn FairinoHardwareInterface::on_activate(const r
 
 hardware_interface::CallbackReturn FairinoHardwareInterface::on_deactivate(const rclcpp_lifecycle::State&)
 {
+    last_servo_target_valid_ = false;
     RCLCPP_INFO(rclcpp::get_logger("FairinoHardwareInterface"), "Stopping ...please wait...");
     // ★백그라운드 서비스 spin 정지: executor cancel → 스레드 join → 리소스 해제(순서 중요).
     stopServiceThread();
@@ -303,6 +322,12 @@ void FairinoHardwareInterface::commitDiagnostics() {
     control_diagnostics_.hard_inhibit = hard_inhibit_.load();
     control_diagnostics_.drag_hold = _post_drag_hold;
     control_diagnostics_.estop_hold = _post_estop_hold;
+    control_diagnostics_.drag_active = _drag_active;
+    control_diagnostics_.drag_transition_failed = drag_transition_failed_;
+    control_diagnostics_.flange_drag_button_enabled = flange_drag_button_enabled_;
+    control_diagnostics_.raw_tool_di = rt_snapshot_.tl_dgt_input_l;
+    control_diagnostics_.main_error = rt_snapshot_.main_code;
+    control_diagnostics_.sub_error = rt_snapshot_.sub_code;
     control_diagnostics_.flush_generation = flush_requested_.load();
     control_diagnostics_.flush_completed_generation = flush_completed_.load();
     control_diagnostics_.flush_result = flush_result_.load();
@@ -329,11 +354,14 @@ void FairinoHardwareInterface::publishDiagnostics() {
     status.message = "servo control";
     const double sample_age_sec = (std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count() - snapshot.sampled_at_ns) * 1e-9;
-    if (!snapshot.state_valid || sample_age_sec > 0.2 || snapshot.flush_inhibit ||
+    if (snapshot.drag_transition_failed) {
+        status.level = diagnostic_msgs::msg::DiagnosticStatus::ERROR;
+        status.message = "drag/servo mode switch failed; hardware restart required";
+    } else if (!snapshot.state_valid || sample_age_sec > 0.2 || snapshot.flush_inhibit ||
         snapshot.rpc[SERVO_RPC].rc != 0) {
         status.level = diagnostic_msgs::msg::DiagnosticStatus::ERROR;
         status.message = "state/servo/flush blocked";
-    } else if (snapshot.cancel_hold || snapshot.drag_hold || snapshot.estop_hold ||
+    } else if (snapshot.cancel_hold || snapshot.drag_hold || snapshot.estop_hold || snapshot.drag_active ||
                snapshot.safety0 || snapshot.safety1 || snapshot.robot_state == 4) {
         status.level = diagnostic_msgs::msg::DiagnosticStatus::WARN;
         status.message = "holding or safety/drag stop";
@@ -354,6 +382,8 @@ void FairinoHardwareInterface::publishDiagnostics() {
     add("servoJCmdNum", snapshot.servo_command_count);
     add("target_state_error_rad", snapshot.target_state_error_rad);
     add("queue_length", snapshot.queue_length);
+    add("rt_motion_queue_length", snapshot.rt_motion_queue_length);
+    add("duplicate_servo_targets_skipped", snapshot.duplicate_servo_targets_skipped);
     add("flush_generation", snapshot.flush_generation);
     add("flush_completed_generation", snapshot.flush_completed_generation);
     add("flush_result", snapshot.flush_result);
@@ -363,6 +393,12 @@ void FairinoHardwareInterface::publishDiagnostics() {
     add("hard_inhibit", snapshot.hard_inhibit);
     add("post_drag_hold", snapshot.drag_hold);
     add("post_estop_hold", snapshot.estop_hold);
+    add("drag_active", snapshot.drag_active);
+    add("drag_transition_failed", snapshot.drag_transition_failed);
+    add("flange_drag_button_enabled", snapshot.flange_drag_button_enabled);
+    add("raw_tool_di", snapshot.raw_tool_di);
+    add("controller_main_error", snapshot.main_error);
+    add("controller_sub_error", snapshot.sub_error);
     add("robot_state", snapshot.robot_state);
     add("safety_stop0_state", snapshot.safety0);
     add("safety_stop1_state", snapshot.safety1);
@@ -420,11 +456,14 @@ void FairinoHardwareInterface::requestStopAndFlush(
     }
     const bool completed = flush_completed_.load() >= generation;
     const int result = flush_result_.load();
-    response.success = completed && result == static_cast<int>(FlushResult::SUCCESS);
+    const bool restart_required = resume_after_stop && hard_inhibit_.load();
+    response.success = completed && result == static_cast<int>(FlushResult::SUCCESS) &&
+        !restart_required;
     response.message = std::string(resume_after_stop ? "stop_and_flush" : "stop_and_hold") +
         " generation=" + std::to_string(generation) +
         (completed ? " result=" + std::to_string(result)
                    : " timeout; completion unconfirmed, motion remains blocked");
+    if (restart_required) response.message += "; motion hard-inhibited, restart hardware stack";
     flush_callback_busy_.store(false);
 }
 
@@ -443,8 +482,9 @@ bool FairinoHardwareInterface::processFlush() {
     const auto expired = [&]() { return now_ns() >= flush_deadline_ns_.load(); };
     const uint64_t requested = flush_requested_.load();
     if (requested > flush_active_generation_) {
+        last_servo_target_valid_ = false;
         flush_active_generation_ = requested;
-        flush_resume_active_ = flush_resume_requested_.load();
+        flush_resume_active_ = flush_resume_requested_.load() && !hard_inhibit_.load();
         if (!flush_resume_active_) hard_inhibit_.store(true);
         cancel_hold_ = true;
         flush_inhibit_ = true;
@@ -494,7 +534,7 @@ bool FairinoHardwareInterface::processFlush() {
     }
     if (!rt_valid_) return true;
     if (_drag_active || _drag_req.load() != 0 || rt_snapshot_.robot_state == 4 ||
-        !(rt_snapshot_.tl_dgt_input_l & 1) || rt_snapshot_.safety_stop0_state ||
+        (flange_drag_button_enabled_ && !(rt_snapshot_.tl_dgt_input_l & 1)) || rt_snapshot_.safety_stop0_state ||
         rt_snapshot_.safety_stop1_state) {
         finishFlush(FlushResult::UNSAFE_STATE);
         return true;
@@ -602,6 +642,7 @@ hardware_interface::return_type FairinoHardwareInterface::read(
                 _jnt_position_state[j] = state.jt_cur_pos[j] * M_PI / 180.0;
             }
             control_diagnostics_.servo_command_count = state.servoJCmdNum;
+            control_diagnostics_.rt_motion_queue_length = state.mc_queue_len;
             control_diagnostics_.robot_state = state.robot_state;
             control_diagnostics_.safety0 = state.safety_stop0_state;
             control_diagnostics_.safety1 = state.safety_stop1_state;
@@ -631,34 +672,74 @@ hardware_interface::return_type FairinoHardwareInterface::write(
     rt_available_for_write_ = false;
     // Always consume a stop request even when feedback is unavailable.
     if (!fresh_read) {
+        last_servo_target_valid_ = false;
         rt_valid_ = false;
         if (processFlush()) return hardware_interface::return_type::OK;
         return hardware_interface::return_type::ERROR;
     }
-    if (processFlush()) return hardware_interface::return_type::OK;
     const auto& state = rt_snapshot_;
 
-    const bool button = !(state.tl_dgt_input_l & 0x01);
+    const bool button = flange_drag_button_enabled_ && !(state.tl_dgt_input_l & 0x01);
     if (button && !_drag_btn_prev) _drag_req.store(1);
     else if (!button && _drag_btn_prev) _drag_req.store(-1);
     _drag_btn_prev = button;
+    // Physical stop takes precedence even if a drag RPC failed or is active.
+    const bool estop = state.safety_stop0_state || state.safety_stop1_state;
+    if (estop) {
+        last_servo_target_valid_ = false;
+        // Never replay a queued ON after stop release. Preserve an explicit OFF.
+        if (_drag_req.exchange(0) < 0) _drag_req.store(-1);
+        if (!_prev_estop) {
+            const auto start = std::chrono::steady_clock::now();
+            const int rc = _ptr_robot->StopMotion();
+            recordRpc(STOP_RPC, rc, start);
+        }
+        std::copy_n(_jnt_position_state, 6, _hold_target);
+        std::copy_n(_jnt_position_command, 6, _pre_estop_cmd);
+        _prev_estop = true;
+        _post_estop_hold = true;
+        _servo_error_count = 0;
+        processFlush();
+        return hardware_interface::return_type::OK;
+    }
+    _prev_estop = false;
+    if (processFlush()) return hardware_interface::return_type::OK;
     const int drag_command = _drag_req.exchange(0);
+    const auto block_mode_transition = [&]() {
+        drag_transition_failed_ = true;
+        hard_inhibit_.store(true);
+        // Use the existing verified stop-only path, including queue clearance
+        // and fresh stationary feedback; never rearm an uncertain mode switch.
+        flush_resume_requested_.store(false);
+        flush_deadline_ns_.store(std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count() +
+            static_cast<int64_t>(kFlushTimeoutSec * 1e9));
+        flush_requested_.fetch_add(1);
+        processFlush();
+        return hardware_interface::return_type::OK;
+    };
     if (drag_command == 1 && !_drag_active) {
+        last_servo_target_valid_ = false;
         auto start = std::chrono::steady_clock::now();
         const int end_rc = _ptr_robot->ServoMoveEnd();
         recordRpc(END_RPC, end_rc, start);
+        if (end_rc != 0) return block_mode_transition();
         start = std::chrono::steady_clock::now();
         const int drag_rc = _ptr_robot->DragTeachSwitch(1);
         recordRpc(DRAG_RPC, drag_rc, start);
+        if (drag_rc != 0) return block_mode_transition();
         _drag_active = true;
         _servo_error_count = 0;
     } else if (drag_command == -1 && _drag_active) {
+        last_servo_target_valid_ = false;
         auto start = std::chrono::steady_clock::now();
         const int drag_rc = _ptr_robot->DragTeachSwitch(0);
         recordRpc(DRAG_RPC, drag_rc, start);
+        if (drag_rc != 0) return block_mode_transition();
         start = std::chrono::steady_clock::now();
         const int start_rc = _ptr_robot->ServoMoveStart();
         recordRpc(START_RPC, start_rc, start);
+        if (start_rc != 0) return block_mode_transition();
         for (size_t j = 0; j < 6; ++j) {
             _hold_target[j] = _jnt_position_state[j];
             _pre_drag_cmd[j] = _jnt_position_command[j];
@@ -672,6 +753,7 @@ hardware_interface::return_type FairinoHardwareInterface::write(
         return hardware_interface::return_type::OK;
     }
     if (_control_mode != 0) {
+        last_servo_target_valid_ = false;
         if (_control_mode == 1 && std::none_of(_jnt_torque_command, _jnt_torque_command + 6,
                 [](double value) { return !std::isfinite(value); })) {
             return hardware_interface::return_type::OK;  // Existing reserved torque-mode no-op.
@@ -680,11 +762,12 @@ hardware_interface::return_type FairinoHardwareInterface::write(
     }
     if (std::any_of(_jnt_position_command, _jnt_position_command + 6,
                     [](double value) { return !std::isfinite(value); })) {
+        last_servo_target_valid_ = false;
         return hardware_interface::return_type::ERROR;
     }
     const bool drag = state.robot_state == 4;
-    const bool estop = state.safety_stop0_state || state.safety_stop1_state;
     if (drag) {
+        last_servo_target_valid_ = false;
         if (!_prev_drag) std::copy_n(_jnt_position_command, 6, _pre_drag_cmd);
         std::copy_n(_jnt_position_state, 6, _hold_target);
         _prev_drag = true;
@@ -693,21 +776,6 @@ hardware_interface::return_type FairinoHardwareInterface::write(
         return hardware_interface::return_type::OK;
     }
     _prev_drag = false;
-    if (estop) {
-        if (!_prev_estop) {
-            const auto start = std::chrono::steady_clock::now();
-            const int rc = _ptr_robot->StopMotion();
-            recordRpc(STOP_RPC, rc, start);
-        }
-        std::copy_n(_jnt_position_state, 6, _hold_target);
-        std::copy_n(_jnt_position_command, 6, _pre_estop_cmd);
-        _prev_estop = true;
-        _post_estop_hold = true;
-        _servo_error_count = 0;
-        return hardware_interface::return_type::OK;
-    }
-    _prev_estop = false;
-
     const double* target = _jnt_position_command;
     if (_post_drag_hold) {
         double deviation = 0.0;
@@ -750,11 +818,19 @@ hardware_interface::return_type FairinoHardwareInterface::write(
             control_diagnostics_.target_state_error_rad,
             std::fabs(target[j] - _jnt_position_state[j]));
     }
+    // Repeated successful hold points can queue ahead of the next trajectory.
+    // Suppress exact duplicates only: every changed path point still goes out.
+    if (last_servo_target_valid_ &&
+        std::equal(last_servo_target_.begin(), last_servo_target_.end(), target)) {
+        ++control_diagnostics_.duplicate_servo_targets_skipped;
+        return hardware_interface::return_type::OK;
+    }
     const auto start = std::chrono::steady_clock::now();
     const int rc = _ptr_robot->ServoJ(&command, &external, 0, 0,
                                     static_cast<float>(servo_command_period_sec_), 0, 0);
     recordRpc(SERVO_RPC, rc, start);
     if (rc != 0) {
+        last_servo_target_valid_ = false;
         ++_servo_error_count;
         if (_servo_error_count <= 3) {
             auto recovery_start = std::chrono::steady_clock::now();
@@ -765,6 +841,8 @@ hardware_interface::return_type FairinoHardwareInterface::write(
             recordRpc(START_RPC, start_rc, recovery_start);
         }
     } else {
+        std::copy_n(target, last_servo_target_.size(), last_servo_target_.begin());
+        last_servo_target_valid_ = true;
         _servo_error_count = 0;
     }
     return hardware_interface::return_type::OK;
