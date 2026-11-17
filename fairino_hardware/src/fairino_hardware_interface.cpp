@@ -2,19 +2,129 @@
 #include <cmath>
 #include <cstdlib>
 #include <limits>
+#include <iomanip>
+#include <locale>
+#include <sstream>
+#include <random>
 
 #include "fairino_hardware/fairino_hardware_interface.hpp"
 
 namespace fairino_hardware{
 
-FairinoHardwareInterface::~FairinoHardwareInterface() { stopServiceThread(); }
+FairinoHardwareInterface::~FairinoHardwareInterface() {
+    stopServiceThread();
+    if (flight_recorder_) flight_recorder_->shutdown();
+}
+
+void FairinoHardwareInterface::startFlightRecorder() {
+    // Lifecycle/background only. Failure to start telemetry must not change
+    // robot enable, retry, hold, or hardware return policies.
+    try {
+        flight_recorder_->start([this](const IncidentInfo& info) {
+            const auto stats = flight_recorder_->stats();
+            RCLCPP_ERROR(rclcpp::get_logger("FairinoHardwareInterface"),
+                "event=flight_recorder_incident incident_id=%s pid=%d control_tid=%d "
+                "trigger_mono_ns=%lld trigger_unix_ns=%lld post_until_mono_ns=%lld trace_path=%s "
+                "io_errors=%llu queue_dropped=%llu incident_dropped=%llu",
+                info.incident_id.c_str(), info.pid, info.control_tid,
+                static_cast<long long>(info.trigger_mono_ns),
+                static_cast<long long>(info.trigger_unix_ns),
+                static_cast<long long>(info.post_until_mono_ns), info.trace_path.c_str(),
+                static_cast<unsigned long long>(stats.io_errors),
+                static_cast<unsigned long long>(stats.queue_dropped),
+                static_cast<unsigned long long>(stats.incident_dropped));
+        });
+    } catch (const std::exception& error) {
+        RCLCPP_ERROR(rclcpp::get_logger("FairinoHardwareInterface"),
+            "event=flight_recorder_start_failed reason=%s", error.what());
+    }
+}
+
+void FairinoHardwareInterface::recordTrace(
+    TraceKind kind, TraceRpc rpc, int rc, int64_t rpc_begin_mono_ns, uint64_t reasons) {
+    TraceEvent event;
+    event.stamp = clockNow();
+    event.kind = kind;
+    event.rpc = rpc;
+    event.control_tid = controlThreadId();
+    event.rc = rc;
+    event.cycle_index = trace_cycle_index_;
+    event.write_index = control_diagnostics_.write_cycles;
+    event.rpc_begin_mono_ns = rpc_begin_mono_ns;
+    // This deployment's ros2_control cadence is fixed at50Hz. ServoJ cmdT is
+    // interpolation duration; the passed ROS period is measured iteration time.
+    // Neither is the expected cadence used to recognize missed-deadline catch-up.
+    event.nominal_period_sec = 0.02;
+    event.command_period_sec = servo_command_period_sec_;
+    event.reported_period_sec = trace_reported_period_sec_;
+    event.actual_period_sec = control_diagnostics_.actual_loop_period_sec;
+    event.frame_age_sec = rt_frame_seen_
+        ? (event.stamp.mono_ns - std::chrono::duration_cast<std::chrono::nanoseconds>(
+               rt_frame_advanced_at_.time_since_epoch()).count()) * 1e-9 : -1.0;
+    event.trigger_reasons = reasons;
+    event.sdk_observed = control_diagnostics_.sdk.observed;
+    event.sdk_observed_mono_ns = control_diagnostics_.sdk.observed_at_ns;
+    event.state_valid = rt_valid_;
+    if (event.sdk_observed) event.raw_sdk = trace_raw_sdk_;
+    event.command_valid = true;
+    std::copy_n(_jnt_position_command, 6, event.command_rad);
+    event.attempted_target_valid = control_diagnostics_.servo_target_observed;
+    std::copy_n(control_diagnostics_.last_servo_target_rad.begin(), 6, event.attempted_target_rad);
+    event.successful_target_valid = trace_successful_target_observed_;
+    std::copy_n(last_servo_target_.begin(), 6, event.successful_target_rad);
+    event.flags = static_cast<uint64_t>(cancel_hold_) |
+        (static_cast<uint64_t>(flush_inhibit_) << 1) |
+        (static_cast<uint64_t>(hard_inhibit_.load()) << 2) |
+        (static_cast<uint64_t>(_post_drag_hold) << 3) |
+        (static_cast<uint64_t>(_post_estop_hold) << 4) |
+        (static_cast<uint64_t>(_drag_active) << 5) |
+        (static_cast<uint64_t>(drag_transition_failed_) << 6);
+    flight_recorder_->record(event);
+}
+
+void FairinoHardwareInterface::recordRpcBegin(
+    RpcIndex index, std::chrono::steady_clock::time_point start) {
+    static constexpr TraceRpc kinds[] = {TraceRpc::STATE, TraceRpc::SERVO,
+        TraceRpc::STOP, TraceRpc::END, TraceRpc::CLEAR, TraceRpc::QUEUE,
+        TraceRpc::START, TraceRpc::DRAG, TraceRpc::RESET};
+    recordTrace(TraceKind::RPC_BEGIN, kinds[index], 0,
+        std::chrono::duration_cast<std::chrono::nanoseconds>(start.time_since_epoch()).count());
+}
+
+void FairinoHardwareInterface::startServiceThread() {
+    rclcpp::ExecutorOptions options;
+    options.context = _svc_node->get_node_base_interface()->get_context();
+    _svc_exec = std::make_shared<rclcpp::executors::MultiThreadedExecutor>(options, 2);
+    _svc_exec->add_node(_svc_node);
+    _svc_spin_thread = std::thread([this]() { _svc_exec->spin(); });
+}
+
+void FairinoHardwareInterface::drainFaultLogsOnDeactivation() {
+    if (fault_write_index_.load() == fault_read_index_.load() &&
+        fault_snapshots_dropped_.load() == 0) return;
+    // Called after service callbacks have joined AND SDK stop/close calls have
+    // run. A slow log sink must not postpone issuing those existing stop calls.
+    std::thread writer([this]() {
+        DiagnosticSnapshot snapshot;
+        {
+            std::lock_guard<std::mutex> lock(diagnostics_mutex_);
+            snapshot = published_diagnostics_;
+        }
+        logPendingFaults(snapshot, 0.0);
+    });
+    writer.join();
+}
 
 void FairinoHardwareInterface::stopServiceThread() {
     if (_svc_exec) _svc_exec->cancel();
     if (_svc_spin_thread.joinable()) _svc_spin_thread.join();
     if (_svc_exec && _svc_node) _svc_exec->remove_node(_svc_node);
     _svc_exec.reset();
+    stream_timer_.reset();
+    stream_srv_.reset();
+    stream_pub_.reset();
     diagnostics_timer_.reset();
+    trajectory_status_sub_.reset();
     diagnostics_pub_.reset();
     flush_srv_.reset();
     stop_hold_srv_.reset();
@@ -29,6 +139,30 @@ hardware_interface::CallbackReturn FairinoHardwareInterface::on_init(const hardw
         return hardware_interface::CallbackReturn::ERROR;
     }
     info_ = sysinfo;//info_是父类中定义的变量
+
+    stream_guard_enabled_ = true;
+    stream_delay_threshold_sec_ = 0.06;
+    try {
+        const auto enabled = info_.hardware_parameters.find("servo_delay_guard_enabled");
+        if (enabled != info_.hardware_parameters.end()) {
+            if (enabled->second != "true" && enabled->second != "false") throw std::invalid_argument("enabled");
+            stream_guard_enabled_ = enabled->second == "true";
+        }
+        const auto threshold = info_.hardware_parameters.find("servo_delay_threshold_sec");
+        if (threshold != info_.hardware_parameters.end()) {
+            size_t used = 0;
+            stream_delay_threshold_sec_ = std::stod(threshold->second, &used);
+            if (used != threshold->second.size()) throw std::invalid_argument("threshold");
+        }
+        if (!std::isfinite(stream_delay_threshold_sec_) || stream_delay_threshold_sec_ < 0.02 ||
+            stream_delay_threshold_sec_ > 1.0) throw std::invalid_argument("threshold");
+    } catch (const std::exception&) {
+        RCLCPP_ERROR(rclcpp::get_logger("FairinoHardwareInterface"), "Invalid ServoJ delay guard parameters");
+        return hardware_interface::CallbackReturn::ERROR;
+    }
+    std::random_device random;
+    stream_session_ = std::to_string(random()) + "-" + std::to_string(random()) + "-" +
+        std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
 
     flange_drag_button_enabled_ = false;
     const auto button_parameter = info_.hardware_parameters.find("flange_drag_button_enabled");
@@ -171,6 +305,31 @@ std::vector<hardware_interface::CommandInterface> FairinoHardwareInterface::expo
 hardware_interface::CallbackReturn FairinoHardwareInterface::on_activate(const rclcpp_lifecycle::State&)
 {
     using namespace std::chrono_literals;
+    stream_session_ += "-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+    stream_control_ = StreamSnapshot{};
+    stream_published_ = StreamSnapshot{};
+    stream_pending_ = StreamRequest{};
+    stream_last_request_ = StreamRequest{};
+    stream_mailbox_pending_ = false;
+    stream_latched_.store(false);
+    stream_abort_binding_.store(0);
+    stream_rpc_begin_ns_.store(0);
+    stream_lease_binding_.store(0);
+    stream_guard_flush_ = false;
+    control_diagnostics_ = DiagnosticSnapshot{};
+    published_diagnostics_ = DiagnosticSnapshot{};
+    fault_write_index_.store(0);
+    fault_read_index_.store(0);
+    fault_snapshots_dropped_.store(0);
+    previous_fault_active_ = false;
+    snapshot_stale_logged_ = false;
+    reported_aborted_goals_.clear();
+    // Keep the recorder's last incident handoff across fast deactivate/activate;
+    // the host may not poll the short-lived capturing/stopped phases in time.
+    trace_raw_sdk_ = ROBOT_STATE_PKG{};
+    trace_cycle_index_ = 0;
+    trace_successful_target_observed_ = false;
+    trace_reported_period_sec_ = 0.0;
     RCLCPP_INFO(rclcpp::get_logger("FairinoHardwareInterface"), "Starting ...please wait...");
     RCLCPP_INFO(rclcpp::get_logger("FairinoHardwareInterface"),
                 "[servo-diagnostics] cmdT=%.6f s cancel_hold_release_tolerance=0.005000 rad",
@@ -269,13 +428,11 @@ hardware_interface::CallbackReturn FairinoHardwareInterface::on_activate(const r
                    std::shared_ptr<std_srvs::srv::Trigger::Response> response) {
                 requestStopAndFlush(*response, false);
             }, rmw_qos_profile_services_default, flush_callback_group_);
-        diagnostics_pub_ = _svc_node->create_publisher<diagnostic_msgs::msg::DiagnosticArray>(
-            "/diagnostics", rclcpp::QoS(10));
-        diagnostics_timer_ = _svc_node->create_wall_timer(100ms, [this]() { publishDiagnostics(); });
+        createStreamInterfaces();
+        createDiagnosticInterfaces();
+        startFlightRecorder();
         // ★서비스 spin 을 별도 스레드로 — 실시간 write() 루프서 spin_some 을 부르던 걸 대체(지터 제거).
-        _svc_exec = std::make_shared<rclcpp::executors::MultiThreadedExecutor>(rclcpp::ExecutorOptions(), 2);
-        _svc_exec->add_node(_svc_node);
-        _svc_spin_thread = std::thread([this](){ _svc_exec->spin(); });
+        startServiceThread();
         RCLCPP_INFO(rclcpp::get_logger("FairinoHardwareInterface"),
                     "손교시 언락 서비스 준비: /fairino_hw_drag/set_drag_teach (std_srvs/SetBool, 백그라운드 spin)");
         return hardware_interface::CallbackReturn::SUCCESS;
@@ -297,6 +454,10 @@ hardware_interface::CallbackReturn FairinoHardwareInterface::on_deactivate(const
     _ptr_robot->StopMotion();//停止机器人
     _ptr_robot->CloseRPC();//销毁实例，连接断开
     _ptr_robot.reset();
+    // Joining/flushing recorder disk I/O must follow the existing physical
+    // stop and SDK close calls, never delay their issuance.
+    flight_recorder_->shutdown();
+    drainFaultLogsOnDeactivation();
     RCLCPP_INFO(rclcpp::get_logger("FairinoHardwareInterface"), "System successfully stopped!");
     return hardware_interface::CallbackReturn::SUCCESS;
 }
@@ -310,6 +471,18 @@ void FairinoHardwareInterface::recordRpc(
     sample.duration_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - start).count();
     ++sample.calls;
+    if (rc != 0) {
+        sample.last_error_rc = rc;
+        sample.last_error_duration_ms = sample.duration_ms;
+        sample.last_error_at_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        ++sample.errors;
+    }
+    static constexpr TraceRpc kinds[] = {TraceRpc::STATE, TraceRpc::SERVO,
+        TraceRpc::STOP, TraceRpc::END, TraceRpc::CLEAR, TraceRpc::QUEUE,
+        TraceRpc::START, TraceRpc::DRAG, TraceRpc::RESET};
+    recordTrace(TraceKind::RPC_END, kinds[index], rc,
+        std::chrono::duration_cast<std::chrono::nanoseconds>(start.time_since_epoch()).count());
 }
 
 void FairinoHardwareInterface::commitDiagnostics() {
@@ -332,10 +505,206 @@ void FairinoHardwareInterface::commitDiagnostics() {
     control_diagnostics_.flush_completed_generation = flush_completed_.load();
     control_diagnostics_.flush_result = flush_result_.load();
     control_diagnostics_.flush_phase = static_cast<int>(flush_phase_);
+    std::copy_n(_jnt_position_command, 6, control_diagnostics_.command_rad.begin());
+    std::copy_n(_jnt_position_state, 6, control_diagnostics_.measured_rad.begin());
+    control_diagnostics_.frame_age_sec = rt_frame_seen_
+        ? (control_diagnostics_.sampled_at_ns -
+           std::chrono::duration_cast<std::chrono::nanoseconds>(
+               rt_frame_advanced_at_.time_since_epoch()).count()) * 1e-9
+        : -1.0;
+    retainFaultSnapshot();
     // The timer copies this POD under the mutex, then releases it before doing
     // any allocation, formatting or ROS publication. Never block the RT loop.
     std::unique_lock<std::mutex> lock(diagnostics_mutex_, std::try_to_lock);
     if (lock.owns_lock()) published_diagnostics_ = control_diagnostics_;
+}
+
+void FairinoHardwareInterface::retainFaultSnapshot() {
+    const auto& snapshot = control_diagnostics_;
+    const auto& sdk = snapshot.sdk;
+    FaultKey key{};
+    if (sdk.observed) {
+        key[0] = sdk.main_code;
+        key[1] = sdk.sub_code;
+        key[2] = sdk.emergency_stop;
+        key[3] = sdk.collision;
+        key[4] = sdk.safety0;
+        key[5] = sdk.safety1;
+    }
+    key[6] = snapshot.rpc[STATE_RPC].calls != 0 && !snapshot.state_valid;
+    key[7] = snapshot.drag_transition_failed;
+    key[8] = snapshot.flush_result >= static_cast<int>(FlushResult::RPC_ERROR)
+        ? snapshot.flush_result : 0;
+    for (size_t i = 0; i < RPC_COUNT; ++i) {
+        key[9 + i] = snapshot.rpc[i].calls != 0 ? snapshot.rpc[i].rc : 0;
+    }
+    const bool active = std::any_of(key.begin(), key.end(), [](int value) { return value != 0; });
+    if (!active) {
+        previous_fault_active_ = false;
+        return;
+    }
+    if (previous_fault_active_ && key == previous_fault_key_) return;
+    previous_fault_active_ = true;
+    previous_fault_key_ = key;
+    uint64_t reasons = TRIGGER_NONE;
+    if (key[0] || key[1]) reasons |= CONTROLLER_FAULT;
+    if (key[2] || key[3] || key[4] || key[5]) reasons |= SAFETY_FAULT;
+    if (key[6]) {
+        if (!sdk.observed || snapshot.rpc[STATE_RPC].rc != 0) reasons |= MISSING_STATE;
+        else if (std::any_of(sdk.joint_position_deg.begin(), sdk.joint_position_deg.end(),
+                            [](double value) { return !std::isfinite(value); })) {
+            reasons |= NONFINITE_STATE;
+        } else reasons |= STALE_STATE;
+    }
+    if (key[7] || key[8]) reasons |= CONTROLLER_FAULT;
+    recordTrace(TraceKind::STATE, TraceRpc::NONE, 0, 0, reasons);
+    const uint64_t write = fault_write_index_.load(std::memory_order_relaxed);
+    const uint64_t read = fault_read_index_.load(std::memory_order_acquire);
+    if (write - read >= kFaultSnapshotCapacity) {
+        fault_snapshots_dropped_.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    fault_snapshots_[write % kFaultSnapshotCapacity] = snapshot;
+    fault_write_index_.store(write + 1, std::memory_order_release);
+}
+
+void FairinoHardwareInterface::createDiagnosticInterfaces() {
+    diagnostics_pub_ = _svc_node->create_publisher<diagnostic_msgs::msg::DiagnosticArray>(
+        "/diagnostics", rclcpp::QoS(10));
+    trajectory_status_sub_ = _svc_node->create_subscription<action_msgs::msg::GoalStatusArray>(
+        "joint_trajectory_controller/follow_joint_trajectory/_action/status",
+        rclcpp::QoS(1).reliable().transient_local(),
+        [this](action_msgs::msg::GoalStatusArray::ConstSharedPtr statuses) {
+            logTrajectoryAborts(*statuses);
+        });
+    diagnostics_timer_ = _svc_node->create_wall_timer(
+        std::chrono::milliseconds(100), [this]() { publishDiagnostics(); });
+}
+
+void FairinoHardwareInterface::logFaultSnapshot(
+    const char* event, const DiagnosticSnapshot& snapshot, const std::string& goal_id,
+    int64_t goal_accepted_ros_ns) {
+    // Called only by background callbacks, never from read()/write(). SDK state
+    // is the last successful getter result; it may precede a failing ServoJ.
+    const auto& sdk = snapshot.sdk;
+    const int64_t logged_at_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    std::ostringstream text;
+    text.imbue(std::locale::classic());
+    text << std::fixed << std::setprecision(6) << "event=" << event;
+    if (!goal_id.empty()) {
+        text << " goal_uuid=" << goal_id << " goal_accepted_ros_ns=" << goal_accepted_ros_ns;
+    }
+    const char* robot_id = std::getenv("MF_ROBOT_ID");
+    text << " robot_id=" << (robot_id && *robot_id ? robot_id : _controller_ip.c_str())
+         << " snapshot_mono_ns=" << snapshot.sampled_at_ns
+         << " logged_mono_ns=" << logged_at_ns
+         << " snapshot_age_sec=" << (snapshot.sampled_at_ns != 0
+              ? (logged_at_ns - snapshot.sampled_at_ns) * 1e-9 : -1.0)
+         << " sdk_state_observed=" << sdk.observed
+         << " sdk_observed_mono_ns=" << sdk.observed_at_ns
+         << " sdk_sample_age_sec=" << (sdk.observed
+              ? (logged_at_ns - sdk.observed_at_ns) * 1e-9 : -1.0)
+         << " state_valid=" << snapshot.state_valid
+         << " frame=" << sdk.frame << " frame_age_sec=" << snapshot.frame_age_sec
+         << " main_code=" << sdk.main_code << " sub_code=" << sdk.sub_code
+         << " robot_state=" << sdk.robot_state << " robot_mode=" << sdk.robot_mode
+         << " program_state=" << sdk.program_state
+         << " emergency_stop=" << sdk.emergency_stop << " collision=" << sdk.collision
+         << " safety_stop0=" << sdk.safety0 << " safety_stop1=" << sdk.safety1
+         << " motion_done=" << sdk.motion_done << " mc_queue_len=" << sdk.motion_queue_length
+         << " servoJCmdNum=" << sdk.servo_command_count
+         << " actual_loop_period_sec=" << snapshot.actual_loop_period_sec
+         << " cmdT_sec=" << snapshot.command_period_sec
+         << " write_cycles=" << snapshot.write_cycles
+         << " servo_target_observed=" << snapshot.servo_target_observed;
+    const auto joints = [&text](const char* label, const std::array<double, 6>& values) {
+        text << ' ' << label << "=[";
+        for (size_t j = 0; j < values.size(); ++j) {
+            if (j != 0) text << ',';
+            text << values[j];
+        }
+        text << ']';
+    };
+    joints("command_rad", snapshot.command_rad);
+    joints("last_servo_target_rad", snapshot.last_servo_target_rad);
+    joints("measured_rad", snapshot.measured_rad);
+    joints("sdk_joint_position_deg", sdk.joint_position_deg);
+    joints("sdk_joint_velocity_deg_sec", sdk.joint_velocity_deg_sec);
+    text << " cancel_hold=" << snapshot.cancel_hold << " hard_inhibit=" << snapshot.hard_inhibit
+         << " flush_inhibit=" << snapshot.flush_inhibit << " flush_phase=" << snapshot.flush_phase
+         << " flush_result=" << snapshot.flush_result << " drag_active=" << snapshot.drag_active
+         << " flush_generation=" << snapshot.flush_generation
+         << " flush_completed_generation=" << snapshot.flush_completed_generation
+         << " drag_transition_failed=" << snapshot.drag_transition_failed
+         << " drag_hold=" << snapshot.drag_hold << " estop_hold=" << snapshot.estop_hold
+         << " flange_drag_button_enabled=" << snapshot.flange_drag_button_enabled
+         << " raw_tool_di=" << snapshot.raw_tool_di;
+    static constexpr const char* names[] = {
+        "state_rpc", "ServoJ", "StopMotion", "ServoMoveEnd", "MotionQueueClear",
+        "GetMotionQueueLength", "ServoMoveStart", "DragTeachSwitch", "ResetAllError"};
+    for (size_t i = 0; i < RPC_COUNT; ++i) {
+        text << ' ' << names[i] << "_rc=" << snapshot.rpc[i].rc
+             << ' ' << names[i] << "_duration_ms=" << snapshot.rpc[i].duration_ms
+             << ' ' << names[i] << "_calls=" << snapshot.rpc[i].calls;
+        if (snapshot.rpc[i].errors != 0) {
+            text << ' ' << names[i] << "_last_error_rc=" << snapshot.rpc[i].last_error_rc
+                 << ' ' << names[i] << "_last_error_duration_ms="
+                 << snapshot.rpc[i].last_error_duration_ms
+                 << ' ' << names[i] << "_last_error_mono_ns=" << snapshot.rpc[i].last_error_at_ns
+                 << ' ' << names[i] << "_errors=" << snapshot.rpc[i].errors;
+        }
+    }
+    RCLCPP_ERROR(rclcpp::get_logger("FairinoHardwareInterface"), "%s", text.str().c_str());
+}
+
+void FairinoHardwareInterface::logPendingFaults(
+    const DiagnosticSnapshot& latest, double snapshot_age_sec) {
+    const uint64_t dropped = fault_snapshots_dropped_.exchange(0, std::memory_order_relaxed);
+    if (dropped != 0) {
+        RCLCPP_ERROR(rclcpp::get_logger("FairinoHardwareInterface"),
+                     "event=sdk_fault_log_overflow dropped_snapshots=%llu",
+                     static_cast<unsigned long long>(dropped));
+    }
+    // Bound each drain even if faults are changing while the callback runs.
+    const uint64_t end = fault_write_index_.load(std::memory_order_acquire);
+    uint64_t read = fault_read_index_.load(std::memory_order_relaxed);
+    while (read != end) {
+        const auto snapshot = fault_snapshots_[read % kFaultSnapshotCapacity];
+        fault_read_index_.store(++read, std::memory_order_release);
+        logFaultSnapshot("sdk_fault", snapshot);
+    }
+    const bool stale = latest.sampled_at_ns != 0 && snapshot_age_sec > 0.2;
+    if (stale && !snapshot_stale_logged_) {
+        logFaultSnapshot("control_snapshot_stale", latest);
+    }
+    snapshot_stale_logged_ = stale;
+}
+
+void FairinoHardwareInterface::logTrajectoryAborts(
+    const action_msgs::msg::GoalStatusArray& statuses) {
+    std::vector<std::array<uint8_t, 16>> current;
+    for (const auto& status : statuses.status_list) {
+        if (status.status != action_msgs::msg::GoalStatus::STATUS_ABORTED) continue;
+        const auto& id = status.goal_info.goal_id.uuid;
+        current.push_back(id);
+        if (std::find(reported_aborted_goals_.begin(), reported_aborted_goals_.end(), id) !=
+            reported_aborted_goals_.end()) continue;
+        DiagnosticSnapshot snapshot;
+        {
+            std::lock_guard<std::mutex> lock(diagnostics_mutex_);
+            snapshot = published_diagnostics_;
+        }
+        std::ostringstream goal_id;
+        goal_id << std::hex << std::setfill('0');
+        for (uint8_t byte : id) goal_id << std::setw(2) << static_cast<unsigned>(byte);
+        const auto& stamp = status.goal_info.stamp;
+        flight_recorder_->requestIncident(ACTION_ABORT, clockNow(), goal_id.str().c_str(),
+            static_cast<int64_t>(stamp.sec) * 1000000000LL + stamp.nanosec);
+        logFaultSnapshot("trajectory_aborted", snapshot, goal_id.str(),
+                         static_cast<int64_t>(stamp.sec) * 1000000000LL + stamp.nanosec);
+    }
+    reported_aborted_goals_ = std::move(current);
 }
 
 void FairinoHardwareInterface::publishDiagnostics() {
@@ -354,6 +723,7 @@ void FairinoHardwareInterface::publishDiagnostics() {
     status.message = "servo control";
     const double sample_age_sec = (std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count() - snapshot.sampled_at_ns) * 1e-9;
+    logPendingFaults(snapshot, sample_age_sec);
     if (snapshot.drag_transition_failed) {
         status.level = diagnostic_msgs::msg::DiagnosticStatus::ERROR;
         status.message = "drag/servo mode switch failed; hardware restart required";
@@ -430,6 +800,11 @@ void FairinoHardwareInterface::requestStopAndFlush(
         flush_callback_busy_.store(false);
         return;
     }
+    if (resume_after_stop && stream_latched_.load()) {
+        response.message = "ServoJ delay guard requires a matching explicit rearm";
+        flush_callback_busy_.store(false);
+        return;
+    }
     if (resume_after_stop && hard_inhibit_.load()) {
         response.message = "motion is hard-inhibited after an unconfirmed goal; restart hardware stack";
         flush_callback_busy_.store(false);
@@ -472,6 +847,14 @@ void FairinoHardwareInterface::finishFlush(FlushResult result) {
     if (result != FlushResult::SUCCESS) flush_inhibit_ = true;
     flush_result_.store(static_cast<int>(result));
     flush_completed_.store(flush_active_generation_);
+    if (stream_guard_flush_) {
+        stream_control_.phase = result == FlushResult::SUCCESS && streamHealthy() &&
+            stream_control_.reason == StreamState::DELAY && stream_control_.binding != 0 &&
+            stream_control_.recoveries == 0 ? StreamState::QUIESCENT : StreamState::BLOCKED;
+        if (result != FlushResult::SUCCESS && stream_control_.reason == StreamState::DELAY) {
+            stream_control_.reason = result == FlushResult::TIMEOUT ? StreamState::TIMEOUT : StreamState::UNSAFE;
+        }
+    }
 }
 
 bool FairinoHardwareInterface::processFlush() {
@@ -484,8 +867,9 @@ bool FairinoHardwareInterface::processFlush() {
     if (requested > flush_active_generation_) {
         last_servo_target_valid_ = false;
         flush_active_generation_ = requested;
-        flush_resume_active_ = flush_resume_requested_.load() && !hard_inhibit_.load();
-        if (!flush_resume_active_) hard_inhibit_.store(true);
+        flush_resume_active_ = flush_resume_requested_.load() && !hard_inhibit_.load() &&
+            !stream_latched_.load();
+        if (!flush_resume_active_ && !stream_guard_flush_) hard_inhibit_.store(true);
         cancel_hold_ = true;
         flush_inhibit_ = true;
         flush_stationary_frames_ = 0;
@@ -496,14 +880,26 @@ bool FairinoHardwareInterface::processFlush() {
         // Best-effort stop/end/clear even if one operation fails. A request
         // already timed out still stops stale motion, but must never restart it.
         auto start = std::chrono::steady_clock::now();
+        recordRpcBegin(STOP_RPC, start);
         const int stop_rc = _ptr_robot->StopMotion();
         recordRpc(STOP_RPC, stop_rc, start);
-        start = std::chrono::steady_clock::now();
-        const int end_rc = _ptr_robot->ServoMoveEnd();
-        recordRpc(END_RPC, end_rc, start);
-        start = std::chrono::steady_clock::now();
-        const int clear_rc = _ptr_robot->MotionQueueClear();
-        recordRpc(CLEAR_RPC, clear_rc, start);
+        const auto end_servo = [&]() {
+            const auto call_start = std::chrono::steady_clock::now();
+            recordRpcBegin(END_RPC, call_start);
+            const int code = _ptr_robot->ServoMoveEnd();
+            recordRpc(END_RPC, code, call_start);
+            return code;
+        };
+        const auto clear_queue = [&]() {
+            const auto call_start = std::chrono::steady_clock::now();
+            recordRpcBegin(CLEAR_RPC, call_start);
+            const int code = _ptr_robot->MotionQueueClear();
+            recordRpc(CLEAR_RPC, code, call_start);
+            return code;
+        };
+        int end_rc, clear_rc;
+        if (stream_guard_flush_) { clear_rc = clear_queue(); end_rc = end_servo(); }
+        else { end_rc = end_servo(); clear_rc = clear_queue(); }
         control_diagnostics_.queue_length = -1;
         if (stop_rc || end_rc || clear_rc) finishFlush(FlushResult::RPC_ERROR);
         else if (expired()) finishFlush(FlushResult::TIMEOUT);
@@ -518,6 +914,7 @@ bool FairinoHardwareInterface::processFlush() {
     if (flush_phase_ == FlushPhase::WAIT_QUEUE) {
         int length = -1;
         const auto start = std::chrono::steady_clock::now();
+        recordRpcBegin(QUEUE_RPC, start);
         const int rc = _ptr_robot->GetMotionQueueLength(&length);
         recordRpc(QUEUE_RPC, rc, start);
         control_diagnostics_.queue_length = length;
@@ -542,6 +939,38 @@ bool FairinoHardwareInterface::processFlush() {
     if (flush_phase_ == FlushPhase::WAIT_STATIONARY) {
         if (rt_snapshot_.frame_cnt == flush_stationary_frame_) return true;
         flush_stationary_frame_ = rt_snapshot_.frame_cnt;
+        if (stream_guard_flush_) {
+            if (!streamHealthy()) { finishFlush(FlushResult::UNSAFE_STATE); return true; }
+            bool velocities_missing = true, velocities_valid = true, stationary = true;
+            for (double velocity : rt_snapshot_.actual_qd) velocities_missing &= std::isnan(velocity);
+            if (!velocities_missing) {
+                for (double velocity : rt_snapshot_.actual_qd) {
+                    velocities_valid &= std::isfinite(velocity);
+                    stationary &= std::fabs(velocity) <= 0.01 * 180.0 / M_PI;
+                }
+            }
+            if (!velocities_valid) { finishFlush(FlushResult::UNSAFE_STATE); return true; }
+            stationary &= rt_snapshot_.robot_state == 1 && rt_snapshot_.motion_done == 1 &&
+                rt_snapshot_.mc_queue_len == 0;
+            const int64_t stamp = now_ns();
+            if (!stationary) { stream_stationary_since_ns_ = 0; return true; }
+            if (stream_stationary_since_ns_ == 0) {
+                stream_stationary_since_ns_ = stamp;
+                std::copy_n(_jnt_position_state, 6, stream_stationary_min_.begin());
+                stream_stationary_max_ = stream_stationary_min_;
+            }
+            for (size_t j = 0; j < 6; ++j) {
+                stream_stationary_min_[j] = std::min(stream_stationary_min_[j], _jnt_position_state[j]);
+                stream_stationary_max_[j] = std::max(stream_stationary_max_[j], _jnt_position_state[j]);
+                if (stream_stationary_max_[j] - stream_stationary_min_[j] > 0.001) {
+                    stream_stationary_since_ns_ = 0; return true;
+                }
+            }
+            if (stamp - stream_stationary_since_ns_ < 200000000LL) return true;
+            std::copy_n(_jnt_position_state, 6, _hold_target);
+            finishFlush(FlushResult::SUCCESS);
+            return true;
+        }
         double max_velocity_deg_sec = 0.0;
         bool velocity_valid = true;
         for (double velocity : rt_snapshot_.actual_qd) {
@@ -575,6 +1004,7 @@ bool FairinoHardwareInterface::processFlush() {
             return true;
         }
         const auto start = std::chrono::steady_clock::now();
+        recordRpcBegin(START_RPC, start);
         const int rc = _ptr_robot->ServoMoveStart();
         recordRpc(START_RPC, rc, start);
         if (rc) {
@@ -618,11 +1048,37 @@ bool FairinoHardwareInterface::processFlush() {
 }
 
 hardware_interface::return_type FairinoHardwareInterface::read(
-    const rclcpp::Time&, const rclcpp::Duration&) {
+    const rclcpp::Time&, const rclcpp::Duration& period) {
+    trace_reported_period_sec_ = period.seconds();
+    ++trace_cycle_index_;
+    recordTrace(TraceKind::READ_BEGIN);
     ROBOT_STATE_PKG state{};
     const auto start = std::chrono::steady_clock::now();
+    recordRpcBegin(STATE_RPC, start);
     const int rc = _ptr_robot->GetRobotRealTimeState(&state);
     recordRpc(STATE_RPC, rc, start);
+    if (rc == 0) {
+        trace_raw_sdk_ = state;
+        auto& sdk = control_diagnostics_.sdk;
+        sdk.observed = true;
+        sdk.observed_at_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        sdk.frame = state.frame_cnt;
+        sdk.main_code = state.main_code;
+        sdk.sub_code = state.sub_code;
+        sdk.program_state = state.program_state;
+        sdk.robot_state = state.robot_state;
+        sdk.robot_mode = state.robot_mode;
+        sdk.emergency_stop = state.EmergencyStop;
+        sdk.collision = state.collisionState;
+        sdk.safety0 = state.safety_stop0_state;
+        sdk.safety1 = state.safety_stop1_state;
+        sdk.motion_done = state.motion_done;
+        sdk.motion_queue_length = state.mc_queue_len;
+        sdk.servo_command_count = state.servoJCmdNum;
+        std::copy_n(state.jt_cur_pos, 6, sdk.joint_position_deg.begin());
+        std::copy_n(state.actual_qd, 6, sdk.joint_velocity_deg_sec.begin());
+    }
     rt_valid_ = rc == 0;
     for (size_t j = 0; j < 6 && rt_valid_; ++j) {
         rt_valid_ = std::isfinite(state.jt_cur_pos[j]);
@@ -650,26 +1106,39 @@ hardware_interface::return_type FairinoHardwareInterface::read(
         }
     }
     rt_available_for_write_ = rt_valid_;
+    recordTrace(TraceKind::READ_END, TraceRpc::NONE, rc);
     commitDiagnostics();
+    if (!rt_valid_ && stream_guard_enabled_) {
+        latchStream(StreamState::FEEDBACK_LOST);
+        // Keep read/update/write alive so the serialized stop can be consumed.
+        return hardware_interface::return_type::OK;
+    }
     return rt_valid_ ? hardware_interface::return_type::OK : hardware_interface::return_type::ERROR;
 }
 
 hardware_interface::return_type FairinoHardwareInterface::write(
     const rclcpp::Time&, const rclcpp::Duration& period) {
+    trace_reported_period_sec_ = period.seconds();
     const auto now = std::chrono::steady_clock::now();
     control_diagnostics_.loop_period_sec = period.seconds();
     control_diagnostics_.actual_loop_period_sec = last_write_at_.time_since_epoch().count() == 0
         ? 0.0 : std::chrono::duration<double>(now - last_write_at_).count();
     last_write_at_ = now;
     ++control_diagnostics_.write_cycles;
+    recordTrace(TraceKind::WRITE_BEGIN);
     // Stack scope guard performs only a bounded POD copy, including early exits.
     struct CommitOnExit {
         FairinoHardwareInterface* hardware;
-        ~CommitOnExit() { hardware->commitDiagnostics(); }
+        ~CommitOnExit() {
+            hardware->commitDiagnostics();
+            hardware->commitStreamState();
+            hardware->recordTrace(TraceKind::WRITE_END);
+        }
     } commit{this};
     const bool fresh_read = rt_valid_ && rt_available_for_write_ &&
         std::chrono::duration<double>(now - rt_frame_advanced_at_).count() <= kFreshStateSec;
     rt_available_for_write_ = false;
+    consumeStreamRequest();
     // Always consume a stop request even when feedback is unavailable.
     if (!fresh_read) {
         last_servo_target_valid_ = false;
@@ -683,6 +1152,11 @@ hardware_interface::return_type FairinoHardwareInterface::write(
     if (button && !_drag_btn_prev) _drag_req.store(1);
     else if (!button && _drag_btn_prev) _drag_req.store(-1);
     _drag_btn_prev = button;
+    // An owned trajectory must not resume after physical stop/teach release.
+    // Latch before legacy safety/drag early returns can bypass admission.
+    if (stream_control_.binding != 0 && !streamHealthy()) {
+        latchStream(StreamState::UNSAFE);
+    }
     // Physical stop takes precedence even if a drag RPC failed or is active.
     const bool estop = state.safety_stop0_state || state.safety_stop1_state;
     if (estop) {
@@ -691,6 +1165,7 @@ hardware_interface::return_type FairinoHardwareInterface::write(
         if (_drag_req.exchange(0) < 0) _drag_req.store(-1);
         if (!_prev_estop) {
             const auto start = std::chrono::steady_clock::now();
+            recordRpcBegin(STOP_RPC, start);
             const int rc = _ptr_robot->StopMotion();
             recordRpc(STOP_RPC, rc, start);
         }
@@ -703,6 +1178,7 @@ hardware_interface::return_type FairinoHardwareInterface::write(
         return hardware_interface::return_type::OK;
     }
     _prev_estop = false;
+    if (processStreamRearm()) return hardware_interface::return_type::OK;
     if (processFlush()) return hardware_interface::return_type::OK;
     const int drag_command = _drag_req.exchange(0);
     const auto block_mode_transition = [&]() {
@@ -721,10 +1197,12 @@ hardware_interface::return_type FairinoHardwareInterface::write(
     if (drag_command == 1 && !_drag_active) {
         last_servo_target_valid_ = false;
         auto start = std::chrono::steady_clock::now();
+        recordRpcBegin(END_RPC, start);
         const int end_rc = _ptr_robot->ServoMoveEnd();
         recordRpc(END_RPC, end_rc, start);
         if (end_rc != 0) return block_mode_transition();
         start = std::chrono::steady_clock::now();
+        recordRpcBegin(DRAG_RPC, start);
         const int drag_rc = _ptr_robot->DragTeachSwitch(1);
         recordRpc(DRAG_RPC, drag_rc, start);
         if (drag_rc != 0) return block_mode_transition();
@@ -733,10 +1211,12 @@ hardware_interface::return_type FairinoHardwareInterface::write(
     } else if (drag_command == -1 && _drag_active) {
         last_servo_target_valid_ = false;
         auto start = std::chrono::steady_clock::now();
+        recordRpcBegin(DRAG_RPC, start);
         const int drag_rc = _ptr_robot->DragTeachSwitch(0);
         recordRpc(DRAG_RPC, drag_rc, start);
         if (drag_rc != 0) return block_mode_transition();
         start = std::chrono::steady_clock::now();
+        recordRpcBegin(START_RPC, start);
         const int start_rc = _ptr_robot->ServoMoveStart();
         recordRpc(START_RPC, start_rc, start);
         if (start_rc != 0) return block_mode_transition();
@@ -818,6 +1298,11 @@ hardware_interface::return_type FairinoHardwareInterface::write(
             control_diagnostics_.target_state_error_rad,
             std::fabs(target[j] - _jnt_position_state[j]));
     }
+    if (stream_guard_enabled_ && !stream_latched_.load() && !streamHealthy()) {
+        latchStream(StreamState::UNSAFE);
+        processFlush();
+        return hardware_interface::return_type::OK;
+    }
     // Repeated successful hold points can queue ahead of the next trajectory.
     // Suppress exact duplicates only: every changed path point still goes out.
     if (last_servo_target_valid_ &&
@@ -825,24 +1310,49 @@ hardware_interface::return_type FairinoHardwareInterface::write(
         ++control_diagnostics_.duplicate_servo_targets_skipped;
         return hardware_interface::return_type::OK;
     }
+    if (stream_guard_enabled_) {
+        if (stream_latched_.load()) return hardware_interface::return_type::OK;
+        // Duplicate hold suppression creates benign long gaps between SDK
+        // calls. Detect a missed write cadence only when a new point is due.
+        if (last_servo_target_valid_ &&
+            control_diagnostics_.actual_loop_period_sec >= stream_delay_threshold_sec_) {
+            latchStream(StreamState::DELAY, control_diagnostics_.actual_loop_period_sec);
+            processFlush();
+            return hardware_interface::return_type::OK;
+        }
+    }
     const auto start = std::chrono::steady_clock::now();
+    if (stream_guard_enabled_) stream_rpc_begin_ns_.store(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        start.time_since_epoch()).count());
+    std::copy_n(target, 6, control_diagnostics_.last_servo_target_rad.begin());
+    control_diagnostics_.servo_target_observed = true;
+    recordRpcBegin(SERVO_RPC, start);
     const int rc = _ptr_robot->ServoJ(&command, &external, 0, 0,
                                     static_cast<float>(servo_command_period_sec_), 0, 0);
     recordRpc(SERVO_RPC, rc, start);
+    stream_rpc_begin_ns_.store(0);
+    const double call_duration = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    if (stream_guard_enabled_ && (rc != 0 || call_duration >= stream_delay_threshold_sec_)) {
+        latchStream(rc != 0 ? StreamState::SDK_ERROR : StreamState::DELAY, call_duration);
+        return hardware_interface::return_type::OK;
+    }
     if (rc != 0) {
         last_servo_target_valid_ = false;
         ++_servo_error_count;
         if (_servo_error_count <= 3) {
             auto recovery_start = std::chrono::steady_clock::now();
+            recordRpcBegin(RESET_RPC, recovery_start);
             const int reset_rc = _ptr_robot->ResetAllError();
             recordRpc(RESET_RPC, reset_rc, recovery_start);
             recovery_start = std::chrono::steady_clock::now();
+            recordRpcBegin(START_RPC, recovery_start);
             const int start_rc = _ptr_robot->ServoMoveStart();
             recordRpc(START_RPC, start_rc, recovery_start);
         }
     } else {
         std::copy_n(target, last_servo_target_.size(), last_servo_target_.begin());
         last_servo_target_valid_ = true;
+        trace_successful_target_observed_ = true;
         _servo_error_count = 0;
     }
     return hardware_interface::return_type::OK;

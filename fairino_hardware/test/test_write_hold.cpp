@@ -6,13 +6,20 @@
 #include <cmath>
 #include <cstdint>
 #include <chrono>
+#include <cstdarg>
+#include <cstdio>
 #include <future>
+#include <filesystem>
+#include <fstream>
+#include <functional>
+#include <iterator>
 #include <limits>
 #include <memory>
 #include <string>
 #include <vector>
 
 #include <gtest/gtest.h>
+#include <rcutils/logging.h>
 
 #include "fairino_hardware/fairino_hardware_interface.hpp"
 
@@ -20,8 +27,8 @@ namespace fairino_hardware {
 namespace test {
 
 // The test target compiles the real driver with these SDK definitions instead
-// of linking libfairino. No SDK socket, robot connection, or ROS executor
-// starts.
+// of linking libfairino. No SDK socket or robot connection starts. Logging
+// callbacks use an isolated ROS domain; one test spins only that executor.
 struct SdkState {
   ROBOT_STATE_PKG state{};
   std::vector<JointPos> servo_commands;
@@ -34,6 +41,7 @@ struct SdkState {
   int state_result = 0;
   int stop_result = 0;
   int end_result = 0;
+  std::vector<int> end_results;
   int clear_result = 0;
   int queue_result = 0;
   int start_result = 0;
@@ -42,11 +50,44 @@ struct SdkState {
   int state_calls = 0;
   int clear_calls = 0;
   bool advance_frame = true;
+  bool allow_deactivate = false;
+  int servo_delay_ms = 0;
+  std::function<void()> after_close;
   std::vector<std::string> operations;
   float command_period = 0.0F;
 };
 
 SdkState sdk;
+
+class FaultLogCapture {
+ public:
+  FaultLogCapture() : previous_(rcutils_logging_get_output_handler()) {
+    active_ = this;
+    rcutils_logging_set_output_handler(capture);
+  }
+  ~FaultLogCapture() {
+    rcutils_logging_set_output_handler(previous_);
+    active_ = nullptr;
+  }
+  std::vector<std::string> messages;
+  std::vector<std::string> operations_at_first_message;
+
+ private:
+  static void capture(const rcutils_log_location_t*, int severity, const char* name,
+                      rcutils_time_point_value_t, const char* format, va_list* args) {
+    if (!active_ || severity < RCUTILS_LOG_SEVERITY_ERROR ||
+        std::string(name) != "FairinoHardwareInterface") return;
+    char text[8192];
+    va_list copy;
+    va_copy(copy, *args);
+    std::vsnprintf(text, sizeof(text), format, copy);
+    va_end(copy);
+    if (active_->messages.empty()) active_->operations_at_first_message = sdk.operations;
+    active_->messages.emplace_back(text);
+  }
+  inline static FaultLogCapture* active_ = nullptr;
+  rcutils_logging_output_handler_t previous_;
+};
 
 }  // namespace test
 }  // namespace fairino_hardware
@@ -69,6 +110,9 @@ errno_t FRRobot::ServoJ(JointPos* joints, ExaxisPos*, float, float,
   sdk.servo_commands.push_back(*joints);
   sdk.operations.push_back("servo");
   sdk.command_period = command_period;
+  if (sdk.servo_delay_ms != 0) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(sdk.servo_delay_ms));
+  }
   return sdk.servo_result;
 }
 
@@ -109,6 +153,9 @@ errno_t FRRobot::ServoMoveEnd() {
   auto& sdk = fairino_hardware::test::sdk;
   ++sdk.servo_end_calls;
   sdk.operations.push_back("end");
+  if (static_cast<size_t>(sdk.servo_end_calls) <= sdk.end_results.size()) {
+    return sdk.end_results[sdk.servo_end_calls - 1];
+  }
   return sdk.end_result;
 }
 
@@ -123,6 +170,11 @@ errno_t FRRobot::RPC(const char*) {
 }
 
 errno_t FRRobot::CloseRPC() {
+  if (fairino_hardware::test::sdk.allow_deactivate) {
+    fairino_hardware::test::sdk.operations.push_back("close");
+    if (fairino_hardware::test::sdk.after_close) fairino_hardware::test::sdk.after_close();
+    return 0;
+  }
   ADD_FAILURE() << "write() tests must not enter connection lifecycle methods";
   return -1;
 }
@@ -151,11 +203,14 @@ class FairinoHardwareInterfaceTest
     // The button is active LOW; the idle value must not request a drag.
     test::sdk.state.tl_dgt_input_l = 1;
     test::sdk.state.robot_state = 1;
+    test::sdk.state.rbtEnableState = 1;
+    test::sdk.state.motion_done = 1;
     hardware_ = std::make_unique<FairinoHardwareInterface>();
     hardware_->_ptr_robot = std::make_unique<FRRobot>();
     hardware_->_control_mode = 0;
     setCommand(Joints{});
     setMeasured(Joints{});
+    prepareFlightRecorder({}, false);
   }
 
   void writeCycle() {
@@ -184,6 +239,49 @@ class FairinoHardwareInterfaceTest
     hardware_->flush_result_.store(static_cast<int>(FairinoHardwareInterface::FlushResult::PENDING));
     hardware_->flush_requested_.fetch_add(1);
   }
+
+  using StreamState = mf_manipulator_msgs::msg::ServoStreamState;
+  using StreamControl = mf_manipulator_msgs::srv::ControlServoStream;
+  StreamState streamState() const { return hardware_->streamMessage(hardware_->stream_published_); }
+  StreamControl::Request request(uint8_t command) {
+    const auto state = streamState();
+    StreamControl::Request req;
+    req.command = command;
+    req.session_id = state.session_id;
+    req.operation_id = "unit-owner";
+    req.binding_id = state.binding_id;
+    req.generation = state.generation;
+    req.request_id = ++request_sequence_;
+    return req;
+  }
+  StreamControl::Response control(const StreamControl::Request& req) {
+    StreamControl::Response response;
+    hardware_->handleStreamControl(req, response);
+    return response;
+  }
+  void bindStream() {
+    ASSERT_TRUE(initPeriod("0.02"));
+    writeCycle();
+    const auto req = request(StreamControl::Request::BIND);
+    ASSERT_TRUE(control(req).accepted);
+    writeCycle();
+    ASSERT_EQ(streamState().phase, StreamState::ACTIVE);
+  }
+  void delayStream(int milliseconds = 65) {
+    test::sdk.servo_delay_ms = milliseconds;
+    setCommand({0.1, 0, 0, 0, 0, 0});
+    writeCycle();
+    test::sdk.servo_delay_ms = 0;
+    ASSERT_EQ(streamState().reason, StreamState::DELAY);
+  }
+  void stationaryWindow() {
+    for (int i = 0; i < 28; ++i) {
+      control(request(StreamControl::Request::QUERY));
+      writeCycle();
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+  }
+  uint64_t request_sequence_ = 100;
 
   bool cancelHolding() const { return hardware_->cancel_hold_; }
   bool flushBlocked() const { return hardware_->flush_inhibit_; }
@@ -248,6 +346,49 @@ class FairinoHardwareInterfaceTest
     return hardware_->on_init(info) == hardware_interface::CallbackReturn::SUCCESS;
   }
   auto diagnostics() const { return hardware_->published_diagnostics_; }
+  void prepareDiagnosticPublisher(const std::string& node_namespace = "") {
+    ASSERT_EQ(rcutils_logging_initialize(), RCUTILS_RET_OK);
+    diagnostic_context_ = std::make_shared<rclcpp::Context>();
+    rclcpp::InitOptions init_options;
+    init_options.set_domain_id(231);
+    init_options.auto_initialize_logging(false);
+    diagnostic_context_->init(0, nullptr, init_options);
+    rclcpp::NodeOptions options;
+    options.context(diagnostic_context_).enable_rosout(false).start_parameter_services(false);
+    hardware_->_svc_node = std::make_shared<rclcpp::Node>(
+        "fairino_fault_log_test", node_namespace, options);
+    hardware_->createDiagnosticInterfaces();
+  }
+  void publishDiagnosticSnapshot() { hardware_->publishDiagnostics(); }
+  std::string trajectoryStatusTopic() const {
+    return hardware_->trajectory_status_sub_->get_topic_name();
+  }
+  void trajectoryStatus(int8_t state, uint8_t id = 1) {
+    action_msgs::msg::GoalStatusArray statuses;
+    action_msgs::msg::GoalStatus status;
+    status.status = state;
+    status.goal_info.goal_id.uuid[15] = id;
+    statuses.status_list.push_back(status);
+    hardware_->logTrajectoryAborts(statuses);
+  }
+  void publishStaleSnapshot(double age_sec) {
+    hardware_->logPendingFaults(diagnostics(), age_sec);
+  }
+  void startBackgroundDiagnostics() {
+    // Make the final drain deterministic: no timer may consume the event.
+    hardware_->diagnostics_timer_->cancel();
+    hardware_->startServiceThread();
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    while (!hardware_->_svc_exec->is_spinning() && std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    ASSERT_TRUE(hardware_->_svc_exec->is_spinning());
+  }
+  void stopBackgroundDiagnostics() {
+    test::sdk.allow_deactivate = true;
+    EXPECT_EQ(hardware_->on_deactivate(rclcpp_lifecycle::State()),
+              hardware_interface::CallbackReturn::SUCCESS);
+  }
   void requestDrag(bool enable) { hardware_->_drag_req.store(enable ? 1 : -1); }
   bool dragActive() const { return hardware_->_drag_active; }
   void latchHardInhibit() { hardware_->hard_inhibit_.store(true); }
@@ -318,6 +459,46 @@ class FairinoHardwareInterfaceTest
     EXPECT_FLOAT_EQ(test::sdk.command_period, 0.02F);
   }
 
+  void prepareFlightRecorder(FlightRecorder::IncidentCallback callback = {}, bool start = true) {
+    // Both paths are test-private; fake metadata cannot attach the live host recorder.
+    if (trace_directory_.empty()) {
+      char path[] = "/tmp/mf-fairino-driver-flight-test-XXXXXX";
+      ASSERT_NE(mkdtemp(path), nullptr);
+      trace_directory_ = path;
+    }
+    FlightRecorderOptions options;
+    options.output_directory = trace_directory_ + "/traces";
+    options.metadata_directory = trace_directory_ + "/metadata";
+    options.post_window_ns = 20000000;
+    options.correlation_window_ns = 1000000000;
+    options.queue_capacity = 256;
+    options.history_capacity = 256;
+    options.incident_capacity = 512;
+    hardware_->flight_recorder_ = std::make_unique<FlightRecorder>(options);
+    if (start) hardware_->flight_recorder_->start(std::move(callback));
+  }
+
+  std::string finishFlightRecorder() {
+    hardware_->flight_recorder_->shutdown();
+    std::string result;
+    const auto directory = std::filesystem::path(trace_directory_) / "traces";
+    if (std::filesystem::exists(directory)) {
+      for (const auto& entry : std::filesystem::directory_iterator(directory)) {
+        if (entry.path().extension() != ".jsonl") continue;
+        std::ifstream input(entry.path());
+        result.append(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
+      }
+    }
+    return result;
+  }
+  FlightRecorderStats flightStats() const { return hardware_->flight_recorder_->stats(); }
+
+  void TearDown() override {
+    // Join the independent writer before removing its test-private files.
+    hardware_.reset();
+    if (!trace_directory_.empty()) std::filesystem::remove_all(trace_directory_);
+  }
+
   void enterDisplacedHold() {
     beginStop();
     setMeasured(displaced_);
@@ -328,8 +509,537 @@ class FairinoHardwareInterfaceTest
   }
 
   const Joints displaced_{0.3, -0.2, 0.4, -0.5, 0.6, -0.7};
+  std::shared_ptr<rclcpp::Context> diagnostic_context_;
   std::unique_ptr<FairinoHardwareInterface> hardware_;
+  std::string trace_directory_;
 };
+
+TEST_F(FairinoHardwareInterfaceTest, GuardSafetyStopReleaseDoesNotResumeOwnedOldTrajectory) {
+  bindStream();
+  const auto count = test::sdk.servo_commands.size();
+  test::sdk.state.safety_stop0_state = 1;
+  writeCycle();
+  test::sdk.state.safety_stop0_state = 0;
+  setCommand({0.2, 0, 0, 0, 0, 0});
+  writeCycle();
+  EXPECT_EQ(test::sdk.servo_commands.size(), count);
+  EXPECT_EQ(streamState().reason, StreamState::UNSAFE);
+  EXPECT_TRUE(flushBlocked());
+}
+
+TEST_F(FairinoHardwareInterfaceTest, GuardDelaySamplesNeverSendCatchupOrResetErrors) {
+  for (int delay : {65, 200, 1020}) {
+    SetUp();
+    ASSERT_TRUE(initPeriod("0.02"));
+    test::sdk.servo_delay_ms = delay;
+    writeCycle();
+    ASSERT_EQ(test::sdk.servo_commands.size(), 1u);
+    test::sdk.servo_delay_ms = 0;
+    setCommand({0.3, 0, 0, 0, 0, 0});
+    writeCycle();
+    EXPECT_EQ(test::sdk.servo_commands.size(), 1u);
+    EXPECT_EQ(test::sdk.reset_calls, 0);
+    EXPECT_TRUE(flushBlocked());
+    EXPECT_EQ(streamState().reason, StreamState::DELAY);
+  }
+}
+
+TEST_F(FairinoHardwareInterfaceTest, GuardSubthresholdCallAndIdleHoldGapContinue) {
+  ASSERT_TRUE(initPeriod("0.02"));
+  test::sdk.servo_delay_ms = 30;
+  writeCycle();
+  test::sdk.servo_delay_ms = 0;
+  setCommand({0.1, 0, 0, 0, 0, 0});
+  writeCycle();
+  EXPECT_EQ(test::sdk.servo_commands.size(), 2u);
+  std::this_thread::sleep_for(std::chrono::milliseconds(65));
+  writeCycle();  // Unchanged target while idle does not constitute a missed stream.
+  EXPECT_FALSE(flushBlocked());
+}
+
+TEST_F(FairinoHardwareInterfaceTest, GuardMissedActiveCadenceBlocksBeforeSending) {
+  bindStream();
+  const auto count = test::sdk.servo_commands.size();
+  std::this_thread::sleep_for(std::chrono::milliseconds(65));
+  setCommand({0.2, 0, 0, 0, 0, 0});
+  writeCycle();
+  EXPECT_EQ(test::sdk.servo_commands.size(), count);
+  EXPECT_EQ(streamState().reason, StreamState::DELAY);
+}
+
+TEST_F(FairinoHardwareInterfaceTest, GuardQueueZeroStillRequiresMeasuredRest) {
+  bindStream();
+  delayStream();
+  test::sdk.state.robot_state = 2;
+  test::sdk.state.motion_done = 0;
+  stationaryWindow();
+  EXPECT_EQ(streamState().phase, StreamState::STOPPING);
+  EXPECT_EQ(test::sdk.servo_start_calls, 0);
+  test::sdk.state.robot_state = 1;
+  test::sdk.state.motion_done = 1;
+  stationaryWindow();
+  EXPECT_EQ(streamState().phase, StreamState::QUIESCENT);
+  EXPECT_TRUE(flushBlocked());
+  auto stop = std::find(test::sdk.operations.begin(), test::sdk.operations.end(), "stop");
+  ASSERT_NE(stop, test::sdk.operations.end());
+  ASSERT_GE(std::distance(stop, test::sdk.operations.end()), 3);
+  EXPECT_EQ(*std::next(stop), "clear");
+  EXPECT_EQ(*std::next(stop, 2), "end");
+}
+
+TEST_F(FairinoHardwareInterfaceTest, GuardMissingVelocityUsesPositionWindowButMixedNaNBlocks) {
+  bindStream();
+  delayStream();
+  for (auto& velocity : test::sdk.state.actual_qd) velocity = std::numeric_limits<double>::quiet_NaN();
+  stationaryWindow();
+  EXPECT_EQ(streamState().phase, StreamState::QUIESCENT);
+  // A second independent owner fixture tests malformed partial feedback.
+  SetUp();
+  bindStream();
+  delayStream();
+  test::sdk.state.actual_qd[0] = std::numeric_limits<double>::quiet_NaN();
+  stationaryWindow();
+  EXPECT_EQ(streamState().phase, StreamState::BLOCKED);
+  EXPECT_EQ(test::sdk.servo_start_calls, 0);
+}
+
+TEST_F(FairinoHardwareInterfaceTest, GuardMeasuredMotionWithMissingVelocityDoesNotRearm) {
+  bindStream();
+  delayStream();
+  for (auto& velocity : test::sdk.state.actual_qd) velocity = std::numeric_limits<double>::quiet_NaN();
+  for (int i = 0; i < 30; ++i) {
+    setMeasured({i * 0.002, 0, 0, 0, 0, 0});
+    writeCycle();
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  EXPECT_EQ(streamState().phase, StreamState::STOPPING);
+  EXPECT_EQ(test::sdk.servo_start_calls, 0);
+}
+
+TEST_F(FairinoHardwareInterfaceTest, GuardRearmFirstTargetIsMeasuredHoldAndDuplicateIsIdempotent) {
+  bindStream();
+  delayStream();
+  setMeasured({0.07, 0, 0, 0, 0, 0});
+  stationaryWindow();
+  ASSERT_EQ(streamState().phase, StreamState::QUIESCENT);
+  setCommand(measured()); // JTC hold replacement acknowledged by upper owner.
+  auto req = request(StreamControl::Request::REARM);
+  req.hold_position = measured();
+  ASSERT_TRUE(control(req).accepted);
+  const auto count = test::sdk.servo_commands.size();
+  for (int i = 0; i < 3; ++i) writeCycle();
+  ASSERT_EQ(streamState().phase, StreamState::ACTIVE);
+  EXPECT_EQ(streamState().recovery_count, 1);
+  EXPECT_EQ(streamState().completed_request_id, req.request_id);
+  ASSERT_EQ(test::sdk.servo_commands.size(), count + 1);
+  EXPECT_NEAR(test::sdk.servo_commands.back().jPos[0], 0.07 * 180 / M_PI, 1e-6);
+  ASSERT_TRUE(control(req).completed);
+  writeCycle();
+  EXPECT_EQ(test::sdk.servo_start_calls, 1);
+  test::sdk.servo_delay_ms = 65;
+  setCommand({0.08, 0, 0, 0, 0, 0});
+  writeCycle();
+  test::sdk.servo_delay_ms = 0;
+  stationaryWindow();
+  EXPECT_EQ(streamState().phase, StreamState::BLOCKED);
+  EXPECT_EQ(test::sdk.servo_start_calls, 1);
+}
+
+TEST_F(FairinoHardwareInterfaceTest, GuardStaleJtcCommandRejectsRearm) {
+  bindStream();
+  delayStream();
+  stationaryWindow();
+  auto req = request(StreamControl::Request::REARM);
+  req.hold_position = measured();
+  ASSERT_TRUE(control(req).accepted);
+  writeCycle();
+  EXPECT_NE(streamState().request_code, 0);
+  EXPECT_EQ(test::sdk.servo_start_calls, 0);
+  EXPECT_TRUE(flushBlocked());
+}
+
+TEST_F(FairinoHardwareInterfaceTest, GuardCancelWinsOverPendingRearmAndOldSession) {
+  bindStream();
+  delayStream();
+  stationaryWindow();
+  setCommand(measured());
+  auto req = request(StreamControl::Request::REARM);
+  req.hold_position = measured();
+  auto invalid = req;
+  invalid.session_id = "old-session";
+  EXPECT_FALSE(control(invalid).accepted);
+  ASSERT_TRUE(control(req).accepted);
+  auto cancel = request(StreamControl::Request::QUIESCE);
+  control(cancel); // Atomic cancel intent wins even if mailbox is occupied.
+  writeCycle();
+  EXPECT_EQ(test::sdk.servo_start_calls, 0);
+  EXPECT_EQ(streamState().reason, StreamState::CANCELED);
+  EXPECT_TRUE(flushBlocked());
+}
+
+TEST_F(FairinoHardwareInterfaceTest, GuardOwnerDisappearanceBlocksWithoutReset) {
+  bindStream();
+  std::this_thread::sleep_for(std::chrono::milliseconds(1050));
+  writeCycle();
+  EXPECT_EQ(streamState().reason, StreamState::OWNER_LOST);
+  EXPECT_TRUE(flushBlocked());
+  EXPECT_EQ(test::sdk.reset_calls, 0);
+}
+
+TEST_F(FairinoHardwareInterfaceTest, SlowSuccessfulServoMustNotSendCatchupTarget) {
+  ASSERT_TRUE(initPeriod("0.02"));
+  test::sdk.state.rbtEnableState = 1;
+  test::sdk.state.motion_done = 1;
+  test::sdk.servo_delay_ms = 65;
+  writeCycle();
+  test::sdk.servo_delay_ms = 0;
+  setCommand(Joints{0.3, 0, 0, 0, 0, 0});
+  writeCycle();
+  EXPECT_EQ(test::sdk.servo_commands.size(), 1U);
+  EXPECT_EQ(test::sdk.reset_calls, 0);
+  EXPECT_TRUE(flushBlocked());
+}
+
+TEST_F(FairinoHardwareInterfaceTest, FlightRecorderHealthyCyclesStaySilentWithoutExtraSdk) {
+  std::atomic<int> incidents{0};
+  prepareFlightRecorder([&](const IncidentInfo&) { ++incidents; });
+  auto next_cycle = std::chrono::steady_clock::now();
+  for (int cycle = 0; cycle < 10; ++cycle) {
+    // An unpaced fake loop really is a burst and must trigger the recorder.
+    std::this_thread::sleep_until(next_cycle);
+    next_cycle += std::chrono::milliseconds(20);
+    setCommand(Joints{cycle * .01, 0, 0, 0, 0, 0});
+    writeCycle();
+  }
+  EXPECT_TRUE(finishFlightRecorder().empty());
+  EXPECT_EQ(incidents, 0);
+  EXPECT_EQ(test::sdk.state_calls, 10);
+  EXPECT_EQ(test::sdk.servo_commands.size(), 10u);
+  EXPECT_EQ(test::sdk.stop_calls, 0);
+}
+
+TEST_F(FairinoHardwareInterfaceTest, FlightRecorderSuccessfulSlowServoKeepsFullStateAndBothTargets) {
+  prepareFlightRecorder();
+  test::sdk.state.actual_qdd[0] = 123;
+  test::sdk.state.jointDriverTorque[5] = 19;
+  test::sdk.state.cl_dgt_input_h = 18;
+  test::sdk.state.rbtEnableState = 1;
+  writeCycle();
+  test::sdk.servo_delay_ms = 60;
+  setCommand(displaced_);
+  writeCycle();
+  const std::string trace = finishFlightRecorder();
+  EXPECT_NE(trace.find("RPC_SLOW"), std::string::npos);
+  EXPECT_NE(trace.find("\"rpc\":\"SERVO\",\"rc\":0"), std::string::npos);
+  EXPECT_NE(trace.find("\"actual_qdd\":[123,"), std::string::npos);
+  EXPECT_NE(trace.find("\"cl_dgt_input_h\":18"), std::string::npos);
+  EXPECT_NE(trace.find("\"rbtEnableState\":1"), std::string::npos);
+  EXPECT_NE(trace.find("\"raw_sdk_hex\":"), std::string::npos);
+  EXPECT_NE(trace.find("\"attempted_target_valid\":true"), std::string::npos);
+  EXPECT_NE(trace.find("\"successful_target_valid\":true"), std::string::npos);
+  EXPECT_EQ(flightStats().incidents_started, 1u);
+  EXPECT_EQ(test::sdk.state_calls, 2);
+  EXPECT_EQ(test::sdk.servo_commands.size(), 2u);
+  EXPECT_EQ(test::sdk.stop_calls, 0);
+  EXPECT_EQ(test::sdk.reset_calls, 0);
+}
+
+TEST_F(FairinoHardwareInterfaceTest, FlightRecorderInterpolationPeriodDoesNotChangeCadenceDetection) {
+  ASSERT_TRUE(initPeriod("0.1"));
+  std::atomic<int> incidents{0};
+  prepareFlightRecorder([&](const IncidentInfo&) { ++incidents; });
+  auto next_cycle = std::chrono::steady_clock::now();
+  for (int cycle = 0; cycle < 5; ++cycle) {
+    std::this_thread::sleep_until(next_cycle);
+    next_cycle += std::chrono::milliseconds(20);
+    setCommand(Joints{cycle * .01, 0, 0, 0, 0, 0});
+    writeCycle();
+  }
+  EXPECT_TRUE(finishFlightRecorder().empty());
+  EXPECT_EQ(incidents, 0);
+  EXPECT_FLOAT_EQ(test::sdk.command_period, 0.1F);
+  EXPECT_EQ(test::sdk.state_calls, 5);
+  EXPECT_EQ(test::sdk.servo_commands.size(), 5u);
+}
+
+TEST_F(FairinoHardwareInterfaceTest, FlightRecorderSafetyAndActionAbortShareOneIncident) {
+  prepareFlightRecorder();
+  writeCycle();
+  test::sdk.state.safety_stop0_state = 1;
+  writeCycle();
+  trajectoryStatus(action_msgs::msg::GoalStatus::STATUS_ABORTED, 9);
+  const auto trace = finishFlightRecorder();
+  EXPECT_NE(trace.find("SAFETY_FAULT"), std::string::npos);
+  EXPECT_NE(trace.find("ACTION_ABORT"), std::string::npos);
+  EXPECT_NE(trace.find("00000000000000000000000000000009"), std::string::npos);
+  EXPECT_EQ(flightStats().incidents_started, 1u);
+  EXPECT_EQ(test::sdk.stop_calls, 1);
+  EXPECT_EQ(test::sdk.servo_commands.size(), 1u);
+}
+
+TEST_F(FairinoHardwareInterfaceTest, FlightRecorderSlowWriterCannotDelaySdkStopAndClose) {
+  std::promise<void> callback_started;
+  std::promise<void> release_writer;
+  auto release = release_writer.get_future().share();
+  prepareFlightRecorder([&](const IncidentInfo&) {
+    callback_started.set_value();
+    release.wait();
+  });
+  test::sdk.servo_delay_ms = 60;
+  writeCycle();
+  const bool writer_blocked = callback_started.get_future().wait_for(std::chrono::seconds(2)) ==
+      std::future_status::ready;
+  EXPECT_TRUE(writer_blocked);
+  std::promise<void> sdk_closed;
+  auto closed = sdk_closed.get_future();
+  test::sdk.allow_deactivate = true;
+  test::sdk.after_close = [&]() { sdk_closed.set_value(); };
+  auto deactivate = std::async(std::launch::async, [&]() {
+    return hardware_->on_deactivate(rclcpp_lifecycle::State());
+  });
+  const bool stopped_first = closed.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+  EXPECT_TRUE(stopped_first);
+  // Always release, even on failure, so a failed test cannot deadlock teardown.
+  release_writer.set_value();
+  EXPECT_EQ(deactivate.get(), hardware_interface::CallbackReturn::SUCCESS);
+  EXPECT_EQ(test::sdk.operations, (std::vector<std::string>{"servo", "end", "stop", "close"}));
+}
+
+TEST_F(FairinoHardwareInterfaceTest, HealthyMotionDoesNotWriteFaultLogsOrCallExtraSdk) {
+  prepareDiagnosticPublisher();
+  test::FaultLogCapture logs;
+  for (int cycle = 0; cycle < 10; ++cycle) {
+    setCommand(Joints{cycle * 0.01, 0, 0, 0, 0, 0});
+    writeCycle();
+    publishDiagnosticSnapshot();
+  }
+  EXPECT_TRUE(logs.messages.empty());
+  EXPECT_EQ(test::sdk.state_calls, 10);
+  EXPECT_EQ(test::sdk.servo_commands.size(), 10u);
+  EXPECT_EQ(test::sdk.stop_calls, 0);
+}
+
+TEST_F(FairinoHardwareInterfaceTest, TransientControllerFaultIsLoggedAfterItHasCleared) {
+  prepareDiagnosticPublisher();
+  test::FaultLogCapture logs;
+  test::sdk.state.main_code = 14;
+  test::sdk.state.sub_code = 2;
+  test::sdk.state.collisionState = 1;
+  test::sdk.state.EmergencyStop = 1;
+  test::sdk.state.mc_queue_len = 5;
+  test::sdk.state.servoJCmdNum = 73;
+  test::sdk.state.actual_qd[0] = 12.5;
+  setMeasured(displaced_);
+  setCommand(Joints{});
+  writeCycle();
+  EXPECT_TRUE(logs.messages.empty()) << "RT read/write must not format or emit logs";
+  test::sdk.state.main_code = 0;
+  test::sdk.state.sub_code = 0;
+  test::sdk.state.collisionState = 0;
+  test::sdk.state.EmergencyStop = 0;
+  writeCycle();
+  publishDiagnosticSnapshot();
+  ASSERT_EQ(logs.messages.size(), 1u);
+  const auto& message = logs.messages.front();
+  for (const auto* field : {"event=sdk_fault", "main_code=14", "sub_code=2",
+                            "collision=1", "emergency_stop=1", "mc_queue_len=5",
+                            "servoJCmdNum=73", "sdk_joint_position_deg=[",
+                            "sdk_joint_velocity_deg_sec=[12.500000",
+                            "command_rad=[", "last_servo_target_rad=[",
+                            "measured_rad=[", "snapshot_mono_ns=", "frame_age_sec="}) {
+    EXPECT_NE(message.find(field), std::string::npos) << field << " in " << message;
+  }
+  EXPECT_EQ(test::sdk.state_calls, 2);
+}
+
+TEST_F(FairinoHardwareInterfaceTest, PersistentFaultLogsOnceAndRecurrenceLogsAgain) {
+  prepareDiagnosticPublisher();
+  test::FaultLogCapture logs;
+  test::sdk.state.main_code = 14;
+  for (int cycle = 0; cycle < 20; ++cycle) {
+    writeCycle();
+    publishDiagnosticSnapshot();
+  }
+  ASSERT_EQ(logs.messages.size(), 1u);
+  test::sdk.state.sub_code = 8;
+  writeCycle();
+  publishDiagnosticSnapshot();
+  ASSERT_EQ(logs.messages.size(), 2u);
+  test::sdk.state.main_code = 0;
+  test::sdk.state.sub_code = 0;
+  writeCycle();
+  publishDiagnosticSnapshot();
+  EXPECT_EQ(logs.messages.size(), 2u) << "recovery must not add routine logs";
+  test::sdk.state.main_code = 14;
+  writeCycle();
+  publishDiagnosticSnapshot();
+  EXPECT_EQ(logs.messages.size(), 3u);
+}
+
+TEST_F(FairinoHardwareInterfaceTest, FailedStateReadLogsLastObservedStateWithoutExtraRpc) {
+  prepareDiagnosticPublisher();
+  test::FaultLogCapture logs;
+  setMeasured(displaced_);
+  writeCycle();
+  test::sdk.state_result = -2;
+  EXPECT_EQ(readOnly(), hardware_interface::return_type::ERROR);
+  publishDiagnosticSnapshot();
+  ASSERT_EQ(logs.messages.size(), 1u);
+  EXPECT_NE(logs.messages[0].find("state_rpc_rc=-2"), std::string::npos);
+  EXPECT_NE(logs.messages[0].find("state_valid=0"), std::string::npos);
+  EXPECT_NE(logs.messages[0].find("sdk_state_observed=1"), std::string::npos);
+  EXPECT_NE(logs.messages[0].find("sdk_sample_age_sec="), std::string::npos);
+  EXPECT_EQ(test::sdk.state_calls, 2);
+  EXPECT_EQ(test::sdk.servo_commands.size(), 1u);
+}
+
+TEST_F(FairinoHardwareInterfaceTest, ServoFailureKeepsAttemptedTargetAndReturnCode) {
+  prepareDiagnosticPublisher();
+  test::FaultLogCapture logs;
+  test::sdk.servo_result = 14;
+  setCommand(displaced_);
+  writeCycle();
+  EXPECT_TRUE(logs.messages.empty());
+  publishDiagnosticSnapshot();
+  ASSERT_EQ(logs.messages.size(), 1u);
+  EXPECT_NE(logs.messages[0].find("ServoJ_rc=14"), std::string::npos);
+  EXPECT_NE(logs.messages[0].find("last_servo_target_rad=[0.300000,-0.200000"),
+            std::string::npos);
+  EXPECT_NE(logs.messages[0].find("ServoJ_duration_ms="), std::string::npos);
+  EXPECT_EQ(test::sdk.servo_commands.size(), 1u);
+}
+
+TEST_F(FairinoHardwareInterfaceTest, TrajectoryAbortLogsOncePerGoalWithHealthySdkState) {
+  prepareDiagnosticPublisher();
+  test::FaultLogCapture logs;
+  writeCycle();
+  for (int8_t status : {action_msgs::msg::GoalStatus::STATUS_ACCEPTED,
+                        action_msgs::msg::GoalStatus::STATUS_EXECUTING,
+                        action_msgs::msg::GoalStatus::STATUS_SUCCEEDED,
+                        action_msgs::msg::GoalStatus::STATUS_CANCELED}) {
+    trajectoryStatus(status);
+  }
+  EXPECT_TRUE(logs.messages.empty());
+  trajectoryStatus(action_msgs::msg::GoalStatus::STATUS_ABORTED);
+  trajectoryStatus(action_msgs::msg::GoalStatus::STATUS_ABORTED);
+  ASSERT_EQ(logs.messages.size(), 1u);
+  EXPECT_NE(logs.messages[0].find("event=trajectory_aborted"), std::string::npos);
+  EXPECT_NE(logs.messages[0].find("goal_uuid=00000000000000000000000000000001"),
+            std::string::npos);
+  EXPECT_NE(logs.messages[0].find("main_code=0"), std::string::npos);
+  EXPECT_NE(logs.messages[0].find("snapshot_age_sec="), std::string::npos);
+  trajectoryStatus(action_msgs::msg::GoalStatus::STATUS_ABORTED, 2);
+  EXPECT_EQ(logs.messages.size(), 2u);
+  EXPECT_EQ(test::sdk.state_calls, 1);
+  EXPECT_EQ(test::sdk.servo_commands.size(), 1u);
+}
+
+TEST_F(FairinoHardwareInterfaceTest, SafetyFaultIsReportedButNormalStopAndManualModeAreQuiet) {
+  prepareDiagnosticPublisher();
+  test::FaultLogCapture logs;
+  test::sdk.state.robot_mode = 1;
+  test::sdk.state.program_state = 1;
+  test::sdk.state.motion_done = 1;
+  writeCycle();
+  publishDiagnosticSnapshot();
+  EXPECT_TRUE(logs.messages.empty());
+  test::sdk.state.safety_stop0_state = 1;
+  writeCycle();
+  publishDiagnosticSnapshot();
+  ASSERT_EQ(logs.messages.size(), 1u);
+  EXPECT_NE(logs.messages[0].find("safety_stop0=1"), std::string::npos);
+  writeCycle();
+  publishDiagnosticSnapshot();
+  EXPECT_EQ(logs.messages.size(), 1u);
+  EXPECT_EQ(test::sdk.stop_calls, 1);
+}
+
+TEST_F(FairinoHardwareInterfaceTest, InvalidRawFeedbackStillRetainsItsControllerFault) {
+  prepareDiagnosticPublisher();
+  test::FaultLogCapture logs;
+  test::sdk.state.main_code = 23;
+  test::sdk.state.jt_cur_pos[5] = std::numeric_limits<double>::quiet_NaN();
+  EXPECT_EQ(readOnly(), hardware_interface::return_type::ERROR);
+  publishDiagnosticSnapshot();
+  ASSERT_EQ(logs.messages.size(), 1u);
+  EXPECT_NE(logs.messages[0].find("main_code=23"), std::string::npos);
+  EXPECT_NE(logs.messages[0].find("state_valid=0"), std::string::npos);
+  EXPECT_EQ(test::sdk.state_calls, 1);
+  EXPECT_TRUE(test::sdk.servo_commands.empty());
+}
+
+TEST_F(FairinoHardwareInterfaceTest, FaultSnapshotOverflowIsVisibleAndDrainingIsBounded) {
+  prepareDiagnosticPublisher();
+  test::FaultLogCapture logs;
+  for (int code = 1; code <= 100; ++code) {
+    test::sdk.state.main_code = code;
+    writeCycle();
+  }
+  EXPECT_TRUE(logs.messages.empty());
+  publishDiagnosticSnapshot();
+  ASSERT_GT(logs.messages.size(), 1u);
+  EXPECT_LT(logs.messages.size(), 100u);
+  EXPECT_NE(logs.messages[0].find("event=sdk_fault_log_overflow"), std::string::npos);
+  const size_t previous_count = logs.messages.size();
+  publishDiagnosticSnapshot();
+  EXPECT_EQ(logs.messages.size(), previous_count);
+  test::sdk.state.main_code = 101;
+  writeCycle();
+  publishDiagnosticSnapshot();
+  EXPECT_EQ(logs.messages.size(), previous_count + 1);
+}
+
+TEST_F(FairinoHardwareInterfaceTest, StaleControlSnapshotLogsOnceUntilSamplingResumes) {
+  prepareDiagnosticPublisher();
+  test::FaultLogCapture logs;
+  writeCycle();
+  publishStaleSnapshot(0.3);
+  publishStaleSnapshot(0.4);
+  ASSERT_EQ(logs.messages.size(), 1u);
+  EXPECT_NE(logs.messages[0].find("event=control_snapshot_stale"), std::string::npos);
+  publishStaleSnapshot(0.0);
+  EXPECT_EQ(logs.messages.size(), 1u);
+  publishStaleSnapshot(0.3);
+  EXPECT_EQ(logs.messages.size(), 2u);
+}
+
+TEST_F(FairinoHardwareInterfaceTest, AbortObserverUsesFollowJointTrajectoryActionInArmNamespace) {
+  prepareDiagnosticPublisher("/manipulator");
+  EXPECT_EQ(trajectoryStatusTopic(),
+            "/manipulator/joint_trajectory_controller/follow_joint_trajectory/_action/status");
+}
+
+TEST_F(FairinoHardwareInterfaceTest, ModeFailureKeepsFirstRpcErrorEvenWhenStopRetrySucceeds) {
+  prepareDiagnosticPublisher();
+  test::FaultLogCapture logs;
+  test::sdk.end_results = {14, 0};
+  requestDrag(true);
+  writeCycle();
+  publishDiagnosticSnapshot();
+  ASSERT_EQ(logs.messages.size(), 1u);
+  EXPECT_NE(logs.messages[0].find("ServoMoveEnd_last_error_rc=14"), std::string::npos);
+  EXPECT_NE(logs.messages[0].find("ServoMoveEnd_rc=0"), std::string::npos);
+  EXPECT_NE(logs.messages[0].find("drag_transition_failed=1"), std::string::npos);
+  EXPECT_EQ(test::sdk.servo_end_calls, 2);
+  EXPECT_EQ(test::sdk.stop_calls, 1);
+  EXPECT_EQ(test::sdk.clear_calls, 1);
+}
+
+TEST_F(FairinoHardwareInterfaceTest, BackgroundShutdownDrainsFaultBeforeFirstTimerTick) {
+  prepareDiagnosticPublisher();
+  test::FaultLogCapture logs;
+  test::sdk.state_result = -2;
+  EXPECT_EQ(readOnly(), hardware_interface::return_type::ERROR);
+  EXPECT_TRUE(logs.messages.empty());
+  startBackgroundDiagnostics();
+  stopBackgroundDiagnostics();
+  ASSERT_EQ(logs.messages.size(), 1u);
+  EXPECT_NE(logs.messages[0].find("event=sdk_fault"), std::string::npos);
+  EXPECT_NE(logs.messages[0].find("state_rpc_rc=-2"), std::string::npos);
+  EXPECT_EQ(logs.operations_at_first_message,
+            (std::vector<std::string>{"end", "stop", "close"}));
+  EXPECT_EQ(test::sdk.state_calls, 1);
+}
 
 TEST_F(FairinoHardwareInterfaceTest, ReadUsesOneStateRpcAndWriteReusesTheSnapshot) {
   setMeasured(displaced_);

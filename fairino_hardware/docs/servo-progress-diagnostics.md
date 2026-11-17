@@ -1,5 +1,132 @@
 # FR5 서보 무진행 진단 (2026-09-10)
 
+## 2026-11-16 지연·연속 송신·SI 전후 기록 (0.0.6)
+
+0.0.6은 장애 전후 기록을 각각5초에서 **60초**로 늘린다. 기존 flat 메타데이터와
+incident ID/시각 계약은 유지하며 `post_until_mono_ns`는 최초 트리거 뒤60초다.
+호스트 수집기의 스레드·호스트·패킷별 coverage를 함께 확인해야 하며, native 파일이
+완료됐다는 사실만으로 호스트 샘플이 모두 수집됐다고 판단하지 않는다.
+
+13:57 장애의 제어기 캡처에는 목표 갱신 공백209ms와36ms 동안의 큐1→10 증가가
+관절 피드백 소실·SI 보고보다 먼저 관측됐다. 지연의 발생 위치(PC scheduling,
+SDK/network, 제어기)와 지연 뒤 slave 이탈의 물리 원인은 아직 확정되지 않았다.
+SI·케이블·배터리 문제를 오류코드149의 유일한 원인으로 해석하지 않는다.
+
+기존 제어 주기, SDK 호출·재시도 순서, hold/정지/복구 정책은 유지한다. 새 계측은
+`read` 시작·종료, `write` 시작·종료(조기 반환 포함), 기존14개 제어 경로 SDK 호출
+지점의 시작·종료를 기록한다. 성공한 호출도 기록하므로 반환코드0인 지연을 조사할
+수 있다. activation과 deactivation의 SDK 연결·enable 호출 전체를 추적하는 기능은
+아니며, 실제 SDK/네트워크 송수신 시각과 getter 완료 시각은 서로 다르다.
+
+RT에서는 미리 할당한 SPSC 큐에 고정 크기 event를 복사한다. 새 SDK 조회, 문자열
+생성, 파일 I/O, ROS 로그 출력, blocking mutex를 추가하지 않는다. 각 event에는
+CLOCK_MONOTONIC/CLOCK_REALTIME 시각, Linux 제어 TID, read cycle/write 번호,
+기대 제어 주기50Hz(20ms), 별도 ServoJ cmdT, ROS가 전달한 측정 주기와 실제 write 간격, 마지막 getter 관측 시각·frame age·유효성, 명령값,
+마지막 ServoJ 시도 목표와 마지막 성공 목표, hold 플래그가 포함된다. 성공 목표
+관측 여부는 duplicate suppression의 invalidation 상태와 별도로 유지한다.
+
+마지막 성공한 `GetRobotRealTimeState`의 **설치된 SDK 패킷 전체**를 보존한다.
+JSON에는 해당 버전의 모든 필드와 `raw_sdk_size`/`raw_sdk_hex`가 함께 들어간다.
+관절 actual 위치·속도·가속도·토크, 제어기/말단/확장 I/O, SI/E-stop/collision,
+enable, SDK의 controller clock도 포함된다. SDK getter가 실패하면 마지막 성공
+관측값이므로 `sdk_observed_mono_ns`와 `state_valid`를 함께 본다. NaN/Inf는 JSON
+숫자에서는 null로, 원본 bytes에서는 그대로 보존한다. 최신 웹 문서에만 있는 필드를
+이전 SDK에 덧붙이거나0으로 만들어 기록하지 않는다. 배터리 전압·SI 전원전압은
+이 버전의 패킷에 없으므로 관절 토크·그리퍼 전압으로 대체 해석하지 않는다.
+
+전용 백그라운드 writer가 약60초 pre/60초 post를 유지한다. 트리거는50ms 이상인
+제어 간격/SDK 호출(성공 포함), 지연 뒤 빠른 catch-up 주기, 기존 stale/invalid/
+missing 상태·제어기/SI/SDK 오류의 변화, Action ABORTED다. 첫 트리거의 post
+기한은 고정이며 오류가 반복돼도 계속 연장하지 않는다. 완료 뒤5초 이내의 abort
+등은 같은 incident ID에 연계한다. 지속되는 raw fault 자체만으로 재개방하지
+않지만, 이후 timing/RPC 지연은 새로 제한된 길이의 incident를 만들 수 있다.
+
+정상 운전에는 새 반복 콘솔 출력이나 디스크 시계열을 쓰지 않는다. 메모리는
+기본 event 큐8192개, history32768개, incident65536개로 제한한다. 이는50Hz에서
+주기당8개 event의 전후60초를 보관하며, 실제 SDK packet을 포함한 event 크기에
+따라 메모리가 증가한다. 더 높은 event 발생률·writer 지연에 의한 초과와 파일
+실패는 queue/incident drop 및 I/O error 카운터에 남긴다. 디스크에는 hardware
+trace를 최대4개 보존하며 이전 process/reboot의 trace도 회전 대상이다. host
+recorder 파일은 지우지 않는다. 강제 종료 전의 디스크 동기화를 보장하지 않으며,
+정상 shutdown은 기존 ServoMoveEnd/StopMotion/CloseRPC **후에** 잔여 기록을
+partial로 저장하고 writer를 join한다.
+
+호스트 연계(승인된 schema_version=1):
+
+- 메타데이터: `/tmp/mf_fairino_flight_recorder/hardware-<pid>.json`.
+- 실제 trace: `MF_FAIRINO_DIAGNOSTICS_DIR`가 지정되면 그 경로, 아니면
+  `$HOME/.ros/fairino_diagnostics`의 hardware incident JSONL.
+- 메타데이터 필드: `pid`, `/proc/self/stat` field22를 시작 때 한 번 읽은 `process_start_ticks`, 실제 제어 `control_tid`, `phase`, `incident_id`,
+  `trigger_mono_ns`, `trigger_unix_ns`, `post_until_mono_ns`, `trace_path`.
+- phase는 armed/capturing/complete/stopped다. 시작·identity·incident·phase 변경
+  때만 원자 교체하며 정상 armed의 주기 갱신은 하지 않는다. 빠른 deactivate→activate로 armed가 되더라도 최근 incident ID/시각/경로는 다음 incident까지 유지한다. 최초 armed만 비어 있다.
+- incident 시작에 `event=flight_recorder_incident`를 백그라운드에서 한 번만
+  출력한다. 위 식별자/시각/경로와 I/O/drop 카운터를 포함한다.
+
+호스트 recorder는 같은 monotonic clock으로 PC runnable 대기·sleep/network
+blocked 상태와 TCP20003(XMLRPC)/20004(state)의 metadata를 대조한다. TCP8080만
+관측해서 ServoJ 송신 지연을 판정하지 않는다. SDK 수신 buffer에서 복사한 시각을
+실제 packet 수신 시각으로 기록하지 않는다. 하드웨어 캡처만으로 안전입력의 물리
+원인이나 고속 가속/감속 시 공급전압을 확정하지 않는다.
+
+
+## 2026-11-13 오류 발생 시 SDK 상태 로그 (0.0.4)
+
+정상 운전에는 새 주기 로그를 출력하지 않는다. 기존 `/diagnostics`의 최대10Hz
+상태 발행은 유지하고, 아래 경우에만 `FairinoHardwareInterface` ERROR 로그를 남긴다.
+
+- `event=sdk_fault`: SDK 호출 실패, 제어 피드백 unavailable/invalid/stale,
+  컨트롤러 주/부 오류코드, 충돌·비상·SI 안전정지, 모드 전환/flush 실패.
+  같은 오류 조합이 지속되면 한 번만 출력한다. 오류 조합이 바뀌거나 정상 복귀 후
+  다시 발생하면 새로 기록하며 정상 복귀 자체는 출력하지 않는다.
+- `event=trajectory_aborted`: `joint_trajectory_controller/follow_joint_trajectory/_action/status`에서
+  ABORTED goal을 관측했을 때 UUID당 한 번 최신 상태를 기록한다. SDK 오류코드가0인
+  목표 미도달도 기록하기 위한 경로다. 성공·실행 중·정상 취소에는 출력하지 않는다.
+  topic은 서비스 노드의 namespace를 따르므로 MF 팔에서는
+  `/manipulator/joint_trajectory_controller/follow_joint_trajectory/_action/status`다. 상태 topic의 retained
+  ABORTED를 처음 관측한 경우도 포함하므로 이 로그의 관측 시각을 최초 정지 시각으로
+  간주하지 않는다. `goal_uuid`는 하위 FollowJointTrajectory goal UUID이며 상위 BT UUID와는
+  다를 수 있다. `goal_accepted_ros_ns`와 함께 원래 JTC 결과/상태 기록과 대조한다.
+- `event=control_snapshot_stale`: 기존200ms snapshot 지연 조건을 넘었을 때 한 번
+  출력한다. 제어 샘플 갱신이 재개되기 전에는 반복하지 않는다.
+
+로그에는 주/부 오류코드, robot/program/mode 상태, 충돌·비상·안전정지,
+motion_done, 원본 frame, mc_queue_len, servoJCmdNum, 원본 관절각(deg)/속도(deg/s),
+제어 명령/마지막 ServoJ 시도 목표/측정각(rad), hold/flush 상태, 실제 write 간격,
+각 SDK 호출의 최근 반환코드·소요시간·횟수가 포함된다. motion_done=0, 정상 STOP,
+manual/drag 상태, 큐 길이, 추종 오차 자체만으로는 새 오류 로그를 발생시키지 않는다.
+
+한 번이라도 실패한 SDK 호출에는 `*_last_error_rc`, `*_last_error_duration_ms`,
+`*_last_error_mono_ns`, `*_errors`도 포함한다. 같은 write에서 정지/복구 재시도가
+성공해 최신 반환코드가0이 되어도 최초 실패의 코드와 시각을 잃지 않기 위함이다.
+이 필드는 마지막 실패 이력이며 현재도 그 오류가 지속된다는 뜻은 아니다.
+
+`snapshot_mono_ns`는 상태를 보존한 시각, `logged_mono_ns`는 출력 시각이며,
+`snapshot_age_sec`는 두 시각의 차이다. `sdk_observed_mono_ns`는 마지막 성공한 SDK
+getter의 로컬 완료 시각이며 실제 socket 수신 시각이 아니다. `sdk_sample_age_sec`는
+출력 시점에서 그 getter 결과의 나이다. `frame_age_sec`는 snapshot을 보존한 시점의
+마지막 유효 frame counter 변화 후 경과시간이다. getter 실패 시 원본 상태는
+마지막 성공한 관측값이며, `state_valid=0` 및 timestamp/age와 함께 해석한다.
+`sdk_state_observed=0`이면 컨트롤러 상태가 아직 없어0으로 초기화된 필드는 증거로
+해석하지 않는다. SDK 상태는 실패한 ServoJ 호출 이전에 읽은 값일 수 있다.
+
+RT read/write는 SDK 상태 필드를 복사하고 고정 크기16개 오류 snapshot 큐에 넣을 뿐,
+문자열 생성·ROS 로그 출력·추가 SDK 조회를 하지 않는다. 기존100ms 백그라운드
+callback이 출력하므로20ms짜리 일시 오류가 그전에 해제돼도 남는다.
+타이머 이전에 하드웨어가 정상 비활성화돼도 SDK 정지/연결 종료 호출 뒤 별도
+백그라운드 writer에서 남은 오류를 출력한다. 로그 sink가 느려도 기존 정지 호출을
+미루지 않으며, 로그 완료까지 비활성화 응답은 기다린다. 프로세스 강제 종료/전원
+단절이나 on_deactivate 없이 소멸하는 경로까지 내구성을 보장하는 저장소는 아니다.
+오류 조합이 너무 빠르게 바뀌어 큐가 넘치면
+`event=sdk_fault_log_overflow dropped_snapshots=...`로 누락을 표시한다.
+목표/측정각의 전체 시계열이나 네트워크 패킷을 보존하는 기능은 아니며,
+이 snapshot만으로 물리 정지나 과거 명령 재생을 확정하지 않는다.
+
+가짜 SDK로 정상 무출력, 추가 SDK 호출 없음, 일시 오류 보존, 동일 오류 억제/재발,
+실패한 getter의 마지막 상태 표시, ServoJ 실패 목표, SDK 정상 상태의 Action ABORTED,
+안전 입력, 비유한 raw 피드백, 큐 overflow, snapshot 지연, Action namespace,
+재시도 전 오류 이력, 정지/연결 종료 호출 이후 잔여 로그 출력을 검증한다.
+
 ## 2026-11-05 DI0 오인·드래그 전환 실패 수정
 
 일반 플랜지 DI0은 기본적으로 손교시 버튼이 아니다. 자동 감지는 기본 OFF이며,

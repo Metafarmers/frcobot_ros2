@@ -10,9 +10,13 @@
 #include "visibility_control.h"
 #include <vector>
 #include "libfairino/include/robot.h"
+#include "fairino_hardware/flight_recorder.hpp"
 #include <std_srvs/srv/set_bool.hpp>
 #include <std_srvs/srv/trigger.hpp>
 #include <diagnostic_msgs/msg/diagnostic_array.hpp>
+#include <action_msgs/msg/goal_status_array.hpp>
+#include <mf_manipulator_msgs/msg/servo_stream_state.hpp>
+#include <mf_manipulator_msgs/srv/control_servo_stream.hpp>
 #include <rclcpp/executors/multi_threaded_executor.hpp>
 #include <array>
 #include <chrono>
@@ -77,6 +81,16 @@ private:
   std::array<double, 6> last_servo_target_{};
   bool last_servo_target_valid_ = false;
   ROBOT_STATE_PKG rt_snapshot_{};  // read/write control-thread owned, not shared with callbacks
+  // Observation only: preserve the full installed SDK packet, including fields
+  // rejected by control validation. No SDK ABI or control policy changes.
+  ROBOT_STATE_PKG trace_raw_sdk_{};
+  std::unique_ptr<FlightRecorder> flight_recorder_ = std::make_unique<FlightRecorder>();
+  uint64_t trace_cycle_index_ = 0;
+  bool trace_successful_target_observed_ = false;
+  double trace_reported_period_sec_ = 0.0;
+  void startFlightRecorder();
+  void recordTrace(TraceKind kind, TraceRpc rpc = TraceRpc::NONE, int rc = 0,
+                   int64_t rpc_begin_mono_ns = 0, uint64_t reasons = TRIGGER_NONE);
   bool rt_valid_ = false;
   bool rt_available_for_write_ = false;
   bool rt_frame_seen_ = false;
@@ -108,9 +122,43 @@ private:
   double cancel_command_at_flush_[6]{};
   enum RpcIndex : size_t { STATE_RPC, SERVO_RPC, STOP_RPC, END_RPC, CLEAR_RPC,
                           QUEUE_RPC, START_RPC, DRAG_RPC, RESET_RPC, RPC_COUNT };
-  struct RpcSample { int rc = 0; double duration_ms = 0.0; uint64_t calls = 0; };
+  void recordRpcBegin(RpcIndex index, std::chrono::steady_clock::time_point start);
+  struct RpcSample {
+    int rc = 0;
+    double duration_ms = 0.0;
+    uint64_t calls = 0;
+    int last_error_rc = 0;
+    double last_error_duration_ms = 0.0;
+    int64_t last_error_at_ns = 0;
+    uint64_t errors = 0;
+  };
+  struct SdkStateSnapshot {
+    std::array<double, 6> joint_position_deg{};
+    std::array<double, 6> joint_velocity_deg_sec{};
+    int64_t observed_at_ns = 0;  // Local SDK getter completion, not socket receive time.
+    int frame = 0;
+    int main_code = 0;
+    int sub_code = 0;
+    int program_state = 0;
+    int robot_state = 0;
+    int robot_mode = 0;
+    int emergency_stop = 0;
+    int collision = 0;
+    int safety0 = 0;
+    int safety1 = 0;
+    int motion_done = 0;
+    int motion_queue_length = 0;
+    int servo_command_count = 0;
+    bool observed = false;
+  };
   struct DiagnosticSnapshot {
     std::array<RpcSample, RPC_COUNT> rpc{};
+    SdkStateSnapshot sdk;
+    std::array<double, 6> command_rad{};
+    std::array<double, 6> measured_rad{};
+    std::array<double, 6> last_servo_target_rad{};
+    bool servo_target_observed = false;
+    double frame_age_sec = -1.0;
     double command_period_sec = 0.02;
     double loop_period_sec = 0.0;
     double actual_loop_period_sec = 0.0;
@@ -144,13 +192,87 @@ private:
     int sub_error = 0;
   } control_diagnostics_, published_diagnostics_;
   std::mutex diagnostics_mutex_;  // RT uses try_lock; serialization happens only in timer.
+  // Single producer: read/write control thread. Single consumer: the service
+  // node's mutually-exclusive default callback group. No allocation or logging
+  // in the producer, and short-lived errors survive the 100ms timer interval.
+  static constexpr size_t kFaultSnapshotCapacity = 16;
+  using FaultKey = std::array<int, RPC_COUNT + 9>;
+  std::array<DiagnosticSnapshot, kFaultSnapshotCapacity> fault_snapshots_{};
+  std::atomic<uint64_t> fault_write_index_{0};
+  std::atomic<uint64_t> fault_read_index_{0};
+  std::atomic<uint64_t> fault_snapshots_dropped_{0};
+  FaultKey previous_fault_key_{};
+  bool previous_fault_active_ = false;  // Control thread only.
+  bool snapshot_stale_logged_ = false;  // Background callbacks only.
+  std::vector<std::array<uint8_t, 16>> reported_aborted_goals_;
   void recordRpc(RpcIndex index, int rc, std::chrono::steady_clock::time_point start);
   void commitDiagnostics();
+  void createDiagnosticInterfaces();
   void publishDiagnostics();
+  void retainFaultSnapshot();
+  void logPendingFaults(const DiagnosticSnapshot& latest, double snapshot_age_sec);
+  void logFaultSnapshot(const char* event, const DiagnosticSnapshot& snapshot,
+                        const std::string& goal_id = {}, int64_t goal_accepted_ros_ns = 0);
+  void logTrajectoryAborts(const action_msgs::msg::GoalStatusArray& statuses);
   void requestStopAndFlush(std_srvs::srv::Trigger::Response& response, bool resume_after_stop);
   bool processFlush();  // true: this write boundary must send no ServoJ
   void finishFlush(FlushResult result);
+  // The write thread is the sole owner of admission and SDK mutation. The ROS
+  // thread only exchanges bounded POD requests/snapshots through a try-lock.
+  using StreamState = mf_manipulator_msgs::msg::ServoStreamState;
+  using StreamControl = mf_manipulator_msgs::srv::ControlServoStream;
+  struct StreamRequest {
+    uint8_t command = 0;
+    std::array<char, 65> owner{};
+    uint64_t binding = 0, generation = 0, id = 0;
+    std::array<double, 6> hold{};
+    int64_t deadline_ns = 0;
+  } stream_pending_, stream_last_request_;
+  struct StreamSnapshot {
+    std::array<char, 65> owner{};
+    uint64_t binding = 0, generation = 1, completed_id = 0, revision = 0;
+    uint8_t phase = StreamState::IDLE, reason = StreamState::NONE, recoveries = 0;
+    int code = 0;
+    bool feedback_valid = false;
+    double age = -1, last_delay = 0;
+    std::array<double, 6> measured{}, command{};
+    int64_t sampled_ns = 0;
+  } stream_control_, stream_published_;
+  uint8_t stream_logged_phase_ = 255;
+  uint64_t stream_logged_generation_ = 0;
+  bool stream_guard_enabled_ = false;  // on_init enables the deployed guard.
+  double stream_delay_threshold_sec_ = 0.06;
+  std::string stream_session_;
+  std::mutex stream_mutex_;
+  bool stream_mailbox_pending_ = false;
+  std::atomic<bool> stream_latched_{false};
+  std::atomic<uint64_t> stream_abort_binding_{0};
+  std::atomic<int64_t> stream_rpc_begin_ns_{0};
+  std::atomic<uint64_t> stream_lease_binding_{0};
+  std::atomic<int64_t> stream_lease_seen_ns_{0};
+  bool stream_guard_flush_ = false;
+  int64_t stream_stationary_since_ns_ = 0;
+  std::array<double, 6> stream_stationary_min_{}, stream_stationary_max_{};
+  uint8_t stream_rearm_frame_ = 0;
+  unsigned stream_rearm_step_ = 0;
+  StreamRequest stream_rearm_request_;
+  void createStreamInterfaces();
+  void handleStreamControl(const StreamControl::Request&, StreamControl::Response&);
+  StreamState streamMessage(const StreamSnapshot&) const;
+  void publishStreamState();
+  void commitStreamState();
+  void consumeStreamRequest();
+  void latchStream(uint8_t reason, double delay = 0.0);
+  bool processStreamRearm();
+  bool streamHealthy() const;
+  bool streamAtHold(const std::array<double, 6>& hold) const;
+  void finishStreamRequest(const StreamRequest&, int code);
+  rclcpp::Service<StreamControl>::SharedPtr stream_srv_;
+  rclcpp::Publisher<StreamState>::SharedPtr stream_pub_;
+  rclcpp::TimerBase::SharedPtr stream_timer_;
+  void startServiceThread();
   void stopServiceThread();
+  void drainFaultLogsOnDeactivation();
   // ★손교시 SW 언락(전원재시작 불필요): ~/set_drag_teach(SetBool) → DragTeachSwitch 토글.
   //   ★서비스 spin 은 **별도 백그라운드 스레드**(_svc_exec)에서 돈다 — write()(50Hz 실시간)에서
   //   spin_some 을 부르면 매 사이클 executor 를 생성·파괴해 ServoJ 타이밍에 지터를 준다(뚝뚝 끊김·
@@ -162,6 +284,7 @@ private:
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr stop_hold_srv_;
   rclcpp::CallbackGroup::SharedPtr flush_callback_group_;
   rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr diagnostics_pub_;
+  rclcpp::Subscription<action_msgs::msg::GoalStatusArray>::SharedPtr trajectory_status_sub_;
   rclcpp::TimerBase::SharedPtr diagnostics_timer_;
   std::shared_ptr<rclcpp::executors::MultiThreadedExecutor> _svc_exec;
   std::thread _svc_spin_thread;                                          // _svc_exec->spin() 스레드

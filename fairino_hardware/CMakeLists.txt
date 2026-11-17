@@ -19,6 +19,9 @@ find_package(rclcpp_lifecycle REQUIRED)
 find_package(fairino_msgs REQUIRED)
 find_package(std_srvs REQUIRED)
 find_package(diagnostic_msgs REQUIRED)
+find_package(action_msgs REQUIRED)
+find_package(mf_manipulator_msgs REQUIRED)
+find_package(Threads REQUIRED)
 
 
 #set variable
@@ -44,6 +47,8 @@ add_library(
   fairino_hardware
   SHARED
   ./src/fairino_hardware_interface.cpp
+  ./src/flight_recorder.cpp
+  ./src/servo_stream_guard.cpp
 )
 
 #target_compile_definitions(ros2_cmd_server PRIVATE CHN_VERSION)
@@ -75,6 +80,8 @@ ament_target_dependencies(fairino_hardware
   rclcpp_lifecycle
   std_srvs
   diagnostic_msgs
+  action_msgs
+  mf_manipulator_msgs
 )
 
 
@@ -125,20 +132,32 @@ install(CODE "
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)
   find_package(ament_cmake_gmock REQUIRED)
+  find_package(rcutils REQUIRED)
   find_package(hardware_interface REQUIRED)
   # Compile the real write() path against test-only SDK symbols. Deliberately
   # omit fairino_hardware/libfairino linkage so tests cannot connect to a robot.
   ament_add_gmock(test_write_hold
     test/test_write_hold.cpp
     src/fairino_hardware_interface.cpp
+    src/flight_recorder.cpp
+    src/servo_stream_guard.cpp
   )
   target_include_directories(test_write_hold PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}
   )
   ament_target_dependencies(test_write_hold
-    hardware_interface pluginlib rclcpp rclcpp_lifecycle std_srvs diagnostic_msgs
+    hardware_interface pluginlib rclcpp rclcpp_lifecycle std_srvs diagnostic_msgs action_msgs mf_manipulator_msgs rcutils
   )
+  ament_add_gmock(test_flight_recorder
+    test/test_flight_recorder.cpp
+    src/flight_recorder.cpp
+  )
+  target_include_directories(test_flight_recorder PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}
+  )
+  target_link_libraries(test_flight_recorder Threads::Threads)
   # the following line skips the linter which checks for copyrights
   # comment the line when a copyright and license is added to all source files
   set(ament_cmake_copyright_FOUND TRUE)
@@ -151,6 +170,6 @@ endif()
 
 #export
 ament_export_targets(fairino_hardware HAS_LIBRARY_TARGET)
-ament_export_dependencies(ament_cmake rclcpp hardware_interface pluginlib rclcpp_lifecycle)
+ament_export_dependencies(ament_cmake rclcpp hardware_interface pluginlib rclcpp_lifecycle action_msgs mf_manipulator_msgs)
 
 ament_package()
