@@ -49,6 +49,7 @@ add_library(
   ./src/fairino_hardware_interface.cpp
   ./src/flight_recorder.cpp
   ./src/servo_stream_guard.cpp
+  ./src/servo_progress.cpp
 )
 
 #target_compile_definitions(ros2_cmd_server PRIVATE CHN_VERSION)
@@ -133,6 +134,7 @@ if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)
   find_package(ament_cmake_gmock REQUIRED)
   find_package(rcutils REQUIRED)
+  find_package(mf_manipulator_controllers REQUIRED)
   find_package(hardware_interface REQUIRED)
   # Compile the real write() path against test-only SDK symbols. Deliberately
   # omit fairino_hardware/libfairino linkage so tests cannot connect to a robot.
@@ -141,13 +143,15 @@ if(BUILD_TESTING)
     src/fairino_hardware_interface.cpp
     src/flight_recorder.cpp
     src/servo_stream_guard.cpp
+    src/servo_progress.cpp
   )
   target_include_directories(test_write_hold PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}
   )
   ament_target_dependencies(test_write_hold
-    hardware_interface pluginlib rclcpp rclcpp_lifecycle std_srvs diagnostic_msgs action_msgs mf_manipulator_msgs rcutils
+    hardware_interface pluginlib rclcpp rclcpp_lifecycle std_srvs diagnostic_msgs
+    action_msgs mf_manipulator_msgs rcutils mf_manipulator_controllers
   )
   ament_add_gmock(test_flight_recorder
     test/test_flight_recorder.cpp

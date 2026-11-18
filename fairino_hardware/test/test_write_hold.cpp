@@ -22,6 +22,11 @@
 #include <rcutils/logging.h>
 
 #include "fairino_hardware/fairino_hardware_interface.hpp"
+#include "servo_delay_fake_controller.hpp"
+#include <mf_manipulator_controllers/progress_controller.hpp>
+#include <rclcpp_action/rclcpp_action.hpp>
+#include <std_msgs/msg/float64_multi_array.hpp>
+#include <cstdlib>
 
 namespace fairino_hardware {
 namespace test {
@@ -31,6 +36,7 @@ namespace test {
 // callbacks use an isolated ROS domain; one test spins only that executor.
 struct SdkState {
   ROBOT_STATE_PKG state{};
+  std::unique_ptr<ServoDelayFakeController> demo;
   std::vector<JointPos> servo_commands;
   std::vector<uint8_t> drag_requests;
   int stop_calls = 0;
@@ -52,6 +58,7 @@ struct SdkState {
   bool advance_frame = true;
   bool allow_deactivate = false;
   int servo_delay_ms = 0;
+  std::function<void()> before_servo_return;
   std::function<void()> after_close;
   std::vector<std::string> operations;
   float command_period = 0.0F;
@@ -99,6 +106,7 @@ FRRobot::~FRRobot() = default;
 errno_t FRRobot::GetRobotRealTimeState(ROBOT_STATE_PKG* state) {
   auto& sdk = fairino_hardware::test::sdk;
   ++sdk.state_calls;
+  if (sdk.demo) sdk.demo->advance(sdk.state);
   if (sdk.advance_frame) ++sdk.state.frame_cnt;
   *state = sdk.state;
   return sdk.state_result;
@@ -110,9 +118,10 @@ errno_t FRRobot::ServoJ(JointPos* joints, ExaxisPos*, float, float,
   sdk.servo_commands.push_back(*joints);
   sdk.operations.push_back("servo");
   sdk.command_period = command_period;
-  if (sdk.servo_delay_ms != 0) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(sdk.servo_delay_ms));
-  }
+  const int delay = sdk.demo ? sdk.demo->beginServo(*joints, sdk.state) : sdk.servo_delay_ms;
+  if (delay != 0) std::this_thread::sleep_for(std::chrono::milliseconds(delay));
+  if (delay > 0 && sdk.before_servo_return) sdk.before_servo_return();
+  if (sdk.demo) sdk.demo->endServo();
   return sdk.servo_result;
 }
 
@@ -124,6 +133,7 @@ errno_t FRRobot::DragTeachSwitch(uint8_t state) {
 errno_t FRRobot::StopMotion() {
   auto& sdk = fairino_hardware::test::sdk;
   ++sdk.stop_calls;
+  if (sdk.demo) sdk.demo->stop(sdk.state);
   sdk.operations.push_back("stop");
   return sdk.stop_result;
 }
@@ -131,6 +141,7 @@ errno_t FRRobot::StopMotion() {
 errno_t FRRobot::MotionQueueClear() {
   auto& sdk = fairino_hardware::test::sdk;
   ++sdk.clear_calls;
+  if (sdk.demo) sdk.demo->record("MotionQueueClear", sdk.state);
   sdk.operations.push_back("clear");
   return sdk.clear_result;
 }
@@ -145,6 +156,7 @@ errno_t FRRobot::GetMotionQueueLength(int* length) {
 errno_t FRRobot::ServoMoveStart() {
   auto& sdk = fairino_hardware::test::sdk;
   ++sdk.servo_start_calls;
+  if (sdk.demo) sdk.demo->record("ServoMoveStart", sdk.state);
   sdk.operations.push_back("start");
   return sdk.start_result;
 }
@@ -152,6 +164,7 @@ errno_t FRRobot::ServoMoveStart() {
 errno_t FRRobot::ServoMoveEnd() {
   auto& sdk = fairino_hardware::test::sdk;
   ++sdk.servo_end_calls;
+  if (sdk.demo) sdk.demo->record("ServoMoveEnd", sdk.state);
   sdk.operations.push_back("end");
   if (static_cast<size_t>(sdk.servo_end_calls) <= sdk.end_results.size()) {
     return sdk.end_results[sdk.servo_end_calls - 1];
@@ -283,6 +296,109 @@ class FairinoHardwareInterfaceTest
   }
   uint64_t request_sequence_ = 100;
 
+  void progressCommand(double sequence, double epoch_offset = 0) {
+    hardware_->progress_command_ = {1, sequence, hardware_->progress_state_[2] + epoch_offset, 0};
+  }
+  auto progressState() const { return hardware_->progress_state_; }
+
+  void runProgressAction(int delay_ms, int robot_mode, int repeats = 1,
+                         bool delay_endpoint = false, bool streaming_controller = false) {
+    using Action = control_msgs::action::FollowJointTrajectory;
+    ASSERT_TRUE(initPeriod("0.02", "", "", true));
+    test::sdk.state.robot_mode = robot_mode;
+    test::sdk.demo = std::make_unique<test::ServoDelayFakeController>(delay_ms);
+    test::sdk.demo->injections_remaining = repeats;
+    if (delay_endpoint) test::sdk.demo->injection_start_rad = 0.1 - 1e-9;
+    if (!rclcpp::ok()) rclcpp::init(0, nullptr);
+    mf_manipulator_controllers::ProgressController controller;
+    rclcpp::NodeOptions options;
+    std::vector<std::string> names{"j1", "j2", "j3", "j4", "j5", "j6"};
+    options.parameter_overrides({
+      rclcpp::Parameter("joints", names),
+      rclcpp::Parameter("command_interfaces", std::vector<std::string>{"position"}),
+      rclcpp::Parameter("state_interfaces", std::vector<std::string>{"position"}),
+      rclcpp::Parameter("constraints.goal_time", 1.0),
+      rclcpp::Parameter("progress.streaming", streaming_controller),
+      rclcpp::Parameter("constraints.j3.goal", delay_endpoint ? 0.01 : 0.0001)});
+    ASSERT_EQ(controller.init("progress_integration", "", options), controller_interface::return_type::OK);
+    ASSERT_EQ(controller.configure().id(), lifecycle_msgs::msg::State::PRIMARY_STATE_INACTIVE);
+    auto commands = hardware_->export_command_interfaces();
+    auto states = hardware_->export_state_interfaces();
+    std::vector<hardware_interface::LoanedCommandInterface> loan_commands;
+    std::vector<hardware_interface::LoanedStateInterface> loan_states;
+    for (auto &command : commands) loan_commands.emplace_back(command);
+    for (auto &state : states) loan_states.emplace_back(state);
+    controller.assign_interfaces(std::move(loan_commands), std::move(loan_states));
+    ASSERT_EQ(readOnly(), hardware_interface::return_type::OK);
+    ASSERT_EQ(controller.get_node()->activate().id(), lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE);
+    auto node = std::make_shared<rclcpp::Node>("progress_client");
+    rclcpp::executors::SingleThreadedExecutor executor;
+    executor.add_node(node);
+    executor.add_node(controller.get_node()->get_node_base_interface());
+    auto client = rclcpp_action::create_client<Action>(node, "/progress_integration/follow_joint_trajectory");
+    ASSERT_TRUE(client->wait_for_action_server(std::chrono::seconds(2)));
+    Action::Goal goal;
+    goal.trajectory.joint_names = names;
+    trajectory_msgs::msg::JointTrajectoryPoint start, end;
+    start.positions.resize(6, 0); end.positions.resize(6, 0);
+    end.positions[2] = 0.1; end.time_from_start.nanosec = 600000000;
+    goal.trajectory.points = {start, end};
+    auto accepted = client->async_send_goal(goal);
+    auto previous = std::chrono::steady_clock::now();
+    auto tick = [&]() {
+      auto now = std::chrono::steady_clock::now();
+      const auto period = rclcpp::Duration::from_seconds(std::chrono::duration<double>(now - previous).count());
+      previous = now;
+      executor.spin_some();
+      EXPECT_EQ(hardware_->read(node->now(), period), hardware_interface::return_type::OK);
+      EXPECT_EQ(controller.update(node->now(), period), controller_interface::return_type::OK);
+      EXPECT_EQ(hardware_->write(node->now(), period), hardware_interface::return_type::OK);
+      executor.spin_some();
+      std::this_thread::sleep_until(now + std::chrono::milliseconds(20));
+    };
+    auto limit = std::chrono::steady_clock::now() + std::chrono::seconds(6);
+    while (accepted.wait_for(std::chrono::seconds(0)) != std::future_status::ready &&
+           std::chrono::steady_clock::now() < limit) tick();
+    ASSERT_EQ(accepted.wait_for(std::chrono::seconds(0)), std::future_status::ready);
+    const auto handle = accepted.get(); ASSERT_NE(handle, nullptr);
+    auto result = client->async_get_result(handle);
+    // Process the action monitor while ServoJ is still in flight. Even when
+    // the endpoint is already within tolerance, success requires its reply.
+    test::sdk.before_servo_return = [&]() {
+      for (int i = 0; i < 3; ++i) {
+        executor.spin_some();
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+      EXPECT_NE(result.wait_for(std::chrono::seconds(0)), std::future_status::ready);
+    };
+    while (result.wait_for(std::chrono::seconds(0)) != std::future_status::ready &&
+           std::chrono::steady_clock::now() < limit) tick();
+    ASSERT_EQ(result.wait_for(std::chrono::seconds(0)), std::future_status::ready);
+    EXPECT_EQ(result.get().code, rclcpp_action::ResultCode::SUCCEEDED);
+    EXPECT_EQ(result.get().goal_id, handle->get_goal_id());
+    EXPECT_EQ(test::sdk.demo->injected, delay_ms > 0);
+    EXPECT_EQ(test::sdk.demo->injection_count, delay_ms > 0 ? repeats : 0);
+    EXPECT_EQ(test::sdk.stop_calls, 0);
+    EXPECT_EQ(streamState().reason, StreamState::NONE);
+    double previous_target = 0, previous_end = 0, first_send = 0;
+    for (const auto &call : test::sdk.demo->calls) {
+      if (call.name != "ServoJ") continue;
+      if (first_send == 0) first_send = call.start;
+      EXPECT_LE(std::abs(call.target - previous_target), 0.003335);
+      if (previous_end > 0) { EXPECT_GE(call.start - previous_end, 0.018); }
+      previous_target = call.target; previous_end = call.end;
+    }
+    if (delay_ms == 0) {
+      // A 0.6s trajectory should retain nominal speed when the SDK is fast.
+      // Allow action scheduling jitter without accepting a systematic 25Hz gate.
+      EXPECT_LT(previous_end - first_send, 0.9);
+    }
+    EXPECT_NEAR(measured()[2], 0.1, 0.0001);
+    EXPECT_DOUBLE_EQ(hardware_->progress_state_[1], hardware_->progress_command_[1]);
+    test::sdk.before_servo_return = {};
+    controller.get_node()->deactivate(); controller.release_interfaces();
+  }
+
   bool cancelHolding() const { return hardware_->cancel_hold_; }
   bool flushBlocked() const { return hardware_->flush_inhibit_; }
   bool hardInhibited() const { return hardware_->hard_inhibit_.load(); }
@@ -330,7 +446,8 @@ class FairinoHardwareInterfaceTest
     hardware_->requestStopAndFlush(response, false);
     return response;
   }
-  bool initPeriod(const std::string& value, const std::string& button = "") {
+  bool initPeriod(const std::string& value, const std::string& button = "",
+                  const std::string& guard = "", bool progress = false) {
     hardware_interface::HardwareInfo info;
     for (int j = 0; j < 6; ++j) {
       hardware_interface::ComponentInfo joint;
@@ -341,16 +458,22 @@ class FairinoHardwareInterfaceTest
       joint.state_interfaces.push_back(position);
       info.joints.push_back(joint);
     }
+    if (progress) {
+      hardware_interface::ComponentInfo gpio;
+      gpio.name = "servo_progress";
+      info.gpios.push_back(gpio);
+    }
+    if (!guard.empty()) info.hardware_parameters["servo_delay_guard_enabled"] = guard;
     if (!value.empty()) info.hardware_parameters["servo_command_period_sec"] = value;
     if (!button.empty()) info.hardware_parameters["flange_drag_button_enabled"] = button;
     return hardware_->on_init(info) == hardware_interface::CallbackReturn::SUCCESS;
   }
   auto diagnostics() const { return hardware_->published_diagnostics_; }
-  void prepareDiagnosticPublisher(const std::string& node_namespace = "") {
+  void prepareDiagnosticPublisher(const std::string& node_namespace = "", size_t domain = 231) {
     ASSERT_EQ(rcutils_logging_initialize(), RCUTILS_RET_OK);
     diagnostic_context_ = std::make_shared<rclcpp::Context>();
     rclcpp::InitOptions init_options;
-    init_options.set_domain_id(231);
+    init_options.set_domain_id(domain);
     init_options.auto_initialize_logging(false);
     diagnostic_context_->init(0, nullptr, init_options);
     rclcpp::NodeOptions options;
@@ -932,6 +1055,165 @@ TEST_F(FairinoHardwareInterfaceTest, TrajectoryAbortLogsOncePerGoalWithHealthySd
   EXPECT_EQ(logs.messages.size(), 2u);
   EXPECT_EQ(test::sdk.state_calls, 1);
   EXPECT_EQ(test::sdk.servo_commands.size(), 1u);
+}
+
+TEST_F(FairinoHardwareInterfaceTest, GuardAdmitsManualModeWithoutChangingRobotMode) {
+  ASSERT_TRUE(initPeriod("0.02"));
+  test::sdk.state.robot_mode = 1;
+  test::sdk.state.program_state = 1;
+  writeCycle();
+  EXPECT_EQ(test::sdk.servo_commands.size(), 1u);
+  EXPECT_EQ(test::sdk.stop_calls, 0);
+  EXPECT_EQ(streamState().reason, StreamState::NONE);
+}
+
+TEST_F(FairinoHardwareInterfaceTest, RealJtcRetainsGoalThrough200msReplyInManualMode) {
+  runProgressAction(200, 1);
+}
+
+TEST_F(FairinoHardwareInterfaceTest, RealJtcFastRepliesRetainNominalTrajectorySpeed) {
+  runProgressAction(0, 1);
+}
+
+TEST_F(FairinoHardwareInterfaceTest, RealJtcRetainsGoalThroughOneSecondReplyInAutomaticMode) {
+  runProgressAction(1000, 0);
+}
+
+TEST_F(FairinoHardwareInterfaceTest, RealJtcRetainsGoalThroughRepeatedDelayedReplies) {
+  runProgressAction(200, 1, 3);
+}
+
+TEST_F(FairinoHardwareInterfaceTest, RealJtcWaitsForDelayedEndpointReplyBeforeSuccess) {
+  runProgressAction(200, 1, 1, true);
+}
+
+TEST_F(FairinoHardwareInterfaceTest, RealJtcEndpointDelayUsesExtensionBeforeSettlingBudget) {
+  runProgressAction(1200, 1, 1, true);
+}
+
+TEST_F(FairinoHardwareInterfaceTest, RealJtcFixedGoalOnServoControllerDoesNotSkipAfterDelay) {
+  runProgressAction(200, 1, 1, false, true);
+}
+
+TEST_F(FairinoHardwareInterfaceTest, DelayedAcknowledgementRequiresNewFeedbackAndPacing) {
+  ASSERT_TRUE(initPeriod("0.02", "", "", true));
+  ASSERT_EQ(readOnly(), hardware_interface::return_type::OK);
+  progressCommand(1);
+  setCommand({0.01, 0, 0, 0, 0, 0});
+  test::sdk.servo_delay_ms = 200;
+  ASSERT_EQ(writeOnly(), hardware_interface::return_type::OK);
+  EXPECT_EQ(progressState()[1], 1);
+  EXPECT_EQ(streamState().reason, StreamState::NONE);
+  EXPECT_EQ(test::sdk.stop_calls, 0);
+  progressCommand(2);
+  setCommand({0.02, 0, 0, 0, 0, 0});
+  test::sdk.servo_delay_ms = 0;
+  writeCycle();  // First cache observation after reply cannot authorize motion.
+  EXPECT_EQ(test::sdk.servo_commands.size(), 1u);
+  test::sdk.advance_frame = false;
+  std::this_thread::sleep_for(std::chrono::milliseconds(25));
+  writeCycle();
+  EXPECT_EQ(test::sdk.servo_commands.size(), 1u);
+  test::sdk.advance_frame = true;
+  writeCycle();
+  EXPECT_EQ(test::sdk.servo_commands.size(), 2u);
+  EXPECT_EQ(progressState()[1], 2);
+}
+
+TEST_F(FairinoHardwareInterfaceTest, FreshReadMayPrepareNextPointBeforeWireSlot) {
+  ASSERT_TRUE(initPeriod("0.02", "", "", true));
+  test::sdk.demo = std::make_unique<test::ServoDelayFakeController>(0);
+  ASSERT_EQ(readOnly(), hardware_interface::return_type::OK);
+  progressCommand(1);
+  setCommand({0.01, 0, 0, 0, 0, 0});
+  writeOnly();
+  ASSERT_EQ(progressState()[1], 1);
+  // read() precedes update()/write(). Gating this fresh read on the previous
+  // wire timestamp rounds a small phase difference up to an entire 20ms tick.
+  ASSERT_EQ(readOnly(), hardware_interface::return_type::OK);
+  ASSERT_EQ(progressState()[0], 1);
+  progressCommand(2);
+  setCommand({0.02, 0, 0, 0, 0, 0});
+  writeOnly();
+  ASSERT_EQ(progressState()[1], 2);
+  ASSERT_EQ(test::sdk.demo->calls.size(), 2u);
+  EXPECT_GE(test::sdk.demo->calls[1].start - test::sdk.demo->calls[0].start, 0.02);
+}
+
+TEST_F(FairinoHardwareInterfaceTest, StopRequestedDuringWirePacingBlocksNextServo) {
+  ASSERT_TRUE(initPeriod("0.02", "", "", true));
+  ASSERT_EQ(readOnly(), hardware_interface::return_type::OK);
+  progressCommand(1);
+  setCommand({0.01, 0, 0, 0, 0, 0});
+  writeOnly();
+  ASSERT_EQ(readOnly(), hardware_interface::return_type::OK);
+  progressCommand(2);
+  setCommand({0.02, 0, 0, 0, 0, 0});
+  auto stopped = std::async(std::launch::async, [this]() {
+    std::this_thread::sleep_for(std::chrono::milliseconds(3));
+    requestFlush();
+  });
+  writeOnly();
+  stopped.get();
+  EXPECT_EQ(test::sdk.servo_commands.size(), 1u);
+  EXPECT_EQ(test::sdk.stop_calls, 1);
+  EXPECT_EQ(progressState()[1], 1);
+}
+
+TEST_F(FairinoHardwareInterfaceTest, UnacknowledgedOrOldEpochCannotReplayTargets) {
+  ASSERT_TRUE(initPeriod("0.02", "", "", true));
+  ASSERT_EQ(readOnly(), hardware_interface::return_type::OK);
+  progressCommand(0);
+  setCommand({0.01, 0, 0, 0, 0, 0});
+  writeOnly();
+  EXPECT_TRUE(test::sdk.servo_commands.empty());
+  progressCommand(1, -1);
+  writeCycle();
+  EXPECT_TRUE(test::sdk.servo_commands.empty());
+  EXPECT_EQ(streamState().reason, StreamState::UNSAFE);
+}
+
+TEST_F(FairinoHardwareInterfaceTest, NormalReplyContinuesThroughCapturedJ2TrackingSample) {
+  ASSERT_TRUE(initPeriod("0.02", "", "", true));
+  // J2 samples from the stop on the first test_e move, 2026-11-18 15:42:28.
+  constexpr double previous = -1.8353575508;
+  constexpr double next = -1.8024577318;
+  setMeasured({0, previous, 0, 0, 0, 0});
+  progressCommand(1);
+  setCommand({0, previous, 0, 0, 0, 0});
+  writeCycle();
+  ASSERT_EQ(progressState()[1], 1);
+
+  setMeasured({0, -110.93602753 * M_PI / 180.0, 0, 0, 0, 0});
+  test::sdk.state.actual_qd[1] = 70.16021426;
+  progressCommand(2);
+  setCommand({0, next, 0, 0, 0, 0});
+  writeCycle();
+  ASSERT_EQ(test::sdk.servo_commands.size(), 2u);
+  EXPECT_NEAR(test::sdk.servo_commands.back().jPos[1], next * 180.0 / M_PI, 1e-6);
+  EXPECT_EQ(progressState()[1], 2);
+  EXPECT_EQ(test::sdk.stop_calls, 0);
+  EXPECT_EQ(streamState().reason, StreamState::NONE);
+}
+
+TEST_F(FairinoHardwareInterfaceTest, SdkErrorNeverAcknowledgesOrAutomaticallyResets) {
+  ASSERT_TRUE(initPeriod("0.02", "", "", true));
+  ASSERT_EQ(readOnly(), hardware_interface::return_type::OK);
+  progressCommand(1);
+  test::sdk.servo_result = -7;
+  writeOnly();
+  EXPECT_EQ(progressState()[1], 0);
+  EXPECT_EQ(streamState().reason, StreamState::SDK_ERROR);
+  EXPECT_EQ(test::sdk.reset_calls, 0);
+}
+
+TEST_F(FairinoHardwareInterfaceTest, RunningServoProgramIsHealthyInBothModes) {
+  ASSERT_TRUE(initPeriod("0.02"));
+  test::sdk.state.program_state = 2;
+  test::sdk.state.robot_state = 2;
+  writeCycle();
+  EXPECT_EQ(test::sdk.servo_commands.size(), 1u);
+  EXPECT_EQ(test::sdk.stop_calls, 0);
 }
 
 TEST_F(FairinoHardwareInterfaceTest, SafetyFaultIsReportedButNormalStopAndManualModeAreQuiet) {

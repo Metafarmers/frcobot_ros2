@@ -26,8 +26,9 @@ bool FairinoHardwareInterface::streamHealthy() const {
          rt_snapshot_.sub_code == 0 && rt_snapshot_.EmergencyStop == 0 &&
          rt_snapshot_.collisionState == 0 &&
          rt_snapshot_.safety_stop0_state == 0 &&
-         rt_snapshot_.safety_stop1_state == 0 && rt_snapshot_.robot_mode == 0 &&
-         rt_snapshot_.program_state != 2 && rt_snapshot_.program_state != 3 &&
+         rt_snapshot_.safety_stop1_state == 0 &&
+         (rt_snapshot_.robot_mode == 0 || rt_snapshot_.robot_mode == 1) &&
+         rt_snapshot_.program_state <= 2 &&
          (rt_snapshot_.robot_state == 1 || rt_snapshot_.robot_state == 2) &&
          !_drag_active && _drag_req.load() == 0 && !hard_inhibit_.load();
 }
@@ -236,7 +237,7 @@ void FairinoHardwareInterface::finishStreamRequest(const StreamRequest &req,
 void FairinoHardwareInterface::consumeStreamRequest() {
   if (stream_control_.binding &&
       (stream_control_.reason == StreamState::NONE ||
-       stream_control_.reason == StreamState::DELAY) &&
+       (stream_control_.reason == StreamState::DELAY || stream_control_.reason == StreamState::PATH_DEVIATION)) &&
       (stream_lease_binding_.load() != stream_control_.binding ||
        monotonicNs() - stream_lease_seen_ns_.load() >= 1000000000LL)) {
     latchStream(StreamState::OWNER_LOST);
@@ -305,7 +306,7 @@ void FairinoHardwareInterface::consumeStreamRequest() {
   }
   if (req.command != StreamControl::Request::REARM ||
       stream_control_.phase != StreamState::QUIESCENT ||
-      stream_control_.reason != StreamState::DELAY ||
+      (stream_control_.reason != StreamState::DELAY && stream_control_.reason != StreamState::PATH_DEVIATION) ||
       stream_control_.recoveries != 0 ||
       stream_abort_binding_.load() == stream_control_.binding ||
       !streamAtHold(req.hold)) {
@@ -321,7 +322,7 @@ void FairinoHardwareInterface::consumeStreamRequest() {
 void FairinoHardwareInterface::latchStream(uint8_t reason, double delay) {
   if (!stream_guard_enabled_)
     return;
-  if (stream_latched_.load() && stream_control_.reason != StreamState::DELAY &&
+  if (stream_latched_.load() && (stream_control_.reason != StreamState::DELAY && stream_control_.reason != StreamState::PATH_DEVIATION) &&
       stream_control_.phase != StreamState::REARMING)
     return;
   if (stream_latched_.load() && stream_control_.reason == reason &&
@@ -330,6 +331,9 @@ void FairinoHardwareInterface::latchStream(uint8_t reason, double delay) {
   if (stream_control_.phase == StreamState::REARMING) {
     finishStreamRequest(stream_rearm_request_, 5);
   }
+  progress_state_[0] = 0;
+  ++progress_state_[2];
+  progress_robot_mode_ = -1;
   stream_latched_.store(true);
   ++stream_control_.generation;
   stream_control_.reason = reason;
@@ -371,7 +375,7 @@ bool FairinoHardwareInterface::processStreamRearm() {
     const double duration =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - start)
             .count();
-    if (rc || duration >= stream_delay_threshold_sec_) {
+    if (rc || (!progress_configured_ && duration >= stream_delay_threshold_sec_)) {
       latchStream(rc ? StreamState::SDK_ERROR : StreamState::DELAY, duration);
       return true;
     }
@@ -397,7 +401,7 @@ bool FairinoHardwareInterface::processStreamRearm() {
     const double duration =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - start)
             .count();
-    if (rc || duration >= stream_delay_threshold_sec_) {
+    if (rc || (!progress_configured_ && duration >= stream_delay_threshold_sec_)) {
       latchStream(rc ? StreamState::SDK_ERROR : StreamState::DELAY, duration);
       return true;
     }
@@ -410,6 +414,8 @@ bool FairinoHardwareInterface::processStreamRearm() {
   cancel_hold_ = false;
   flush_inhibit_ = false;
   stream_guard_flush_ = false;
+  progress_robot_mode_ = rt_snapshot_.robot_mode;
+  progress_post_reply_sample_ = true;
   stream_control_.phase = StreamState::ACTIVE;
   stream_control_.reason = StreamState::NONE;
   finishStreamRequest(stream_rearm_request_, 0);

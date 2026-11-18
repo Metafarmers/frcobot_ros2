@@ -261,7 +261,7 @@ hardware_interface::CallbackReturn FairinoHardwareInterface::on_init(const hardw
         // }
 
     }
-    return hardware_interface::CallbackReturn::SUCCESS;
+    return initializeProgress() ? hardware_interface::CallbackReturn::SUCCESS : hardware_interface::CallbackReturn::ERROR;
 }//end on_init
 
 
@@ -282,6 +282,11 @@ std::vector<hardware_interface::StateInterface> FairinoHardwareInterface::export
     //     info_.joints[i].name, hardware_interface::HW_IF_EFFORT, &_jnt_torque_state.at(i)));
   }
 
+  if (progress_configured_) {
+    const std::array<const char*, 4> names{"ready", "ack", "epoch", "phase"};
+    for (size_t i = 0; i < names.size(); ++i)
+      state_interfaces.emplace_back(progress_resource_, names[i], &progress_state_[i]);
+  }
   //导出
   return state_interfaces;
 }
@@ -297,6 +302,11 @@ std::vector<hardware_interface::CommandInterface> FairinoHardwareInterface::expo
 //         info_.joints[i].name, hardware_interface::HW_IF_EFFORT, &_jnt_torque_command.at(i)));
   }
 
+  if (progress_configured_) {
+    const std::array<const char*, 4> names{"mode", "sequence", "epoch", "stop"};
+    for (size_t i = 0; i < names.size(); ++i)
+      command_interfaces.emplace_back(progress_resource_, names[i], &progress_command_[i]);
+  }
   return command_interfaces;
 }
 
@@ -306,6 +316,10 @@ hardware_interface::CallbackReturn FairinoHardwareInterface::on_activate(const r
 {
     using namespace std::chrono_literals;
     stream_session_ += "-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+    progress_state_ = {0, 0, progress_state_[2] + 1, 0};
+    progress_command_ = {0, 0, progress_state_[2], 0};
+    progress_robot_mode_ = -1;
+    progress_wait_frame_ = progress_post_reply_sample_ = false;
     stream_control_ = StreamSnapshot{};
     stream_published_ = StreamSnapshot{};
     stream_pending_ = StreamRequest{};
@@ -849,9 +863,9 @@ void FairinoHardwareInterface::finishFlush(FlushResult result) {
     flush_completed_.store(flush_active_generation_);
     if (stream_guard_flush_) {
         stream_control_.phase = result == FlushResult::SUCCESS && streamHealthy() &&
-            stream_control_.reason == StreamState::DELAY && stream_control_.binding != 0 &&
+            (stream_control_.reason == StreamState::DELAY || stream_control_.reason == StreamState::PATH_DEVIATION) && stream_control_.binding != 0 &&
             stream_control_.recoveries == 0 ? StreamState::QUIESCENT : StreamState::BLOCKED;
-        if (result != FlushResult::SUCCESS && stream_control_.reason == StreamState::DELAY) {
+        if (result != FlushResult::SUCCESS && (stream_control_.reason == StreamState::DELAY || stream_control_.reason == StreamState::PATH_DEVIATION)) {
             stream_control_.reason = result == FlushResult::TIMEOUT ? StreamState::TIMEOUT : StreamState::UNSAFE;
         }
     }
@@ -1106,6 +1120,7 @@ hardware_interface::return_type FairinoHardwareInterface::read(
         }
     }
     rt_available_for_write_ = rt_valid_;
+    updateProgress();
     recordTrace(TraceKind::READ_END, TraceRpc::NONE, rc);
     commitDiagnostics();
     if (!rt_valid_ && stream_guard_enabled_) {
@@ -1139,6 +1154,20 @@ hardware_interface::return_type FairinoHardwareInterface::write(
         std::chrono::duration<double>(now - rt_frame_advanced_at_).count() <= kFreshStateSec;
     rt_available_for_write_ = false;
     consumeStreamRequest();
+    if (progress_configured_ && progress_command_[3] == 1) {
+        progress_command_[3] = 0;
+        if (stream_control_.binding != 0) {
+            latchStream(StreamState::CANCELED);
+        } else if (!stream_latched_.load() && !flush_inhibit_) {
+            progress_state_[0] = 0;
+            ++progress_state_[2];
+            progress_robot_mode_ = -1;
+            flush_resume_requested_.store(true);
+            flush_deadline_ns_.store(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                now.time_since_epoch()).count() + static_cast<int64_t>(kFlushTimeoutSec * 1e9));
+            flush_requested_.fetch_add(1);
+        }
+    }
     // Always consume a stop request even when feedback is unavailable.
     if (!fresh_read) {
         last_servo_target_valid_ = false;
@@ -1303,18 +1332,23 @@ hardware_interface::return_type FairinoHardwareInterface::write(
         processFlush();
         return hardware_interface::return_type::OK;
     }
+    if (!admitProgressTarget(target)) {
+        processFlush();
+        return hardware_interface::return_type::OK;
+    }
     // Repeated successful hold points can queue ahead of the next trajectory.
     // Suppress exact duplicates only: every changed path point still goes out.
     if (last_servo_target_valid_ &&
         std::equal(last_servo_target_.begin(), last_servo_target_.end(), target)) {
         ++control_diagnostics_.duplicate_servo_targets_skipped;
+        acknowledgeProgress(0.0);
         return hardware_interface::return_type::OK;
     }
     if (stream_guard_enabled_) {
         if (stream_latched_.load()) return hardware_interface::return_type::OK;
         // Duplicate hold suppression creates benign long gaps between SDK
         // calls. Detect a missed write cadence only when a new point is due.
-        if (last_servo_target_valid_ &&
+        if (!progressActive() && last_servo_target_valid_ &&
             control_diagnostics_.actual_loop_period_sec >= stream_delay_threshold_sec_) {
             latchStream(StreamState::DELAY, control_diagnostics_.actual_loop_period_sec);
             processFlush();
@@ -1332,7 +1366,7 @@ hardware_interface::return_type FairinoHardwareInterface::write(
     recordRpc(SERVO_RPC, rc, start);
     stream_rpc_begin_ns_.store(0);
     const double call_duration = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
-    if (stream_guard_enabled_ && (rc != 0 || call_duration >= stream_delay_threshold_sec_)) {
+    if (stream_guard_enabled_ && (rc != 0 || (!progressActive() && call_duration >= stream_delay_threshold_sec_))) {
         latchStream(rc != 0 ? StreamState::SDK_ERROR : StreamState::DELAY, call_duration);
         return hardware_interface::return_type::OK;
     }
@@ -1353,6 +1387,7 @@ hardware_interface::return_type FairinoHardwareInterface::write(
         std::copy_n(target, last_servo_target_.size(), last_servo_target_.begin());
         last_servo_target_valid_ = true;
         trace_successful_target_observed_ = true;
+        acknowledgeProgress(call_duration);
         _servo_error_count = 0;
     }
     return hardware_interface::return_type::OK;

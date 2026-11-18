@@ -265,6 +265,21 @@ private:
   void latchStream(uint8_t reason, double delay = 0.0);
   bool processStreamRearm();
   bool streamHealthy() const;
+  // Same-thread ros2_control handshake. No ROS callback may write these.
+  bool progress_configured_ = false;
+  std::string progress_resource_ = "servo_progress";
+  std::array<double, 4> progress_command_{{0, 0, 1, 0}};  // mode, sequence, epoch, stop
+  std::array<double, 4> progress_state_{{0, 0, 1, 0}};    // ready, ack, epoch, phase
+  int progress_robot_mode_ = -1;
+  bool progress_post_reply_sample_ = false;
+  uint8_t progress_reply_frame_ = 0;
+  bool progress_wait_frame_ = false;
+  std::chrono::steady_clock::time_point progress_next_send_{};
+  bool initializeProgress();
+  bool progressActive() const;
+  void updateProgress();
+  bool admitProgressTarget(const double *target);
+  void acknowledgeProgress(double duration);
   bool streamAtHold(const std::array<double, 6>& hold) const;
   void finishStreamRequest(const StreamRequest&, int code);
   rclcpp::Service<StreamControl>::SharedPtr stream_srv_;
