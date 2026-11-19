@@ -482,6 +482,68 @@ class FairinoHardwareInterfaceTest
         "fairino_fault_log_test", node_namespace, options);
     hardware_->createDiagnosticInterfaces();
   }
+  void runDelayRecoveryDemo() {
+    const char* output = std::getenv("MF_SERVO_DEMO_OUTPUT");
+    const char* domain_text = std::getenv("MF_SERVO_DEMO_DOMAIN");
+    ASSERT_NE(output, nullptr);
+    ASSERT_NE(domain_text, nullptr);
+    const char* namespace_text = std::getenv("MF_SERVO_DEMO_NAMESPACE");
+    const char* delay_text = std::getenv("MF_SERVO_DEMO_DELAY_MS");
+    const char* guarded_text = std::getenv("MF_SERVO_DEMO_GUARDED");
+    ASSERT_NE(namespace_text, nullptr);
+    ASSERT_NE(delay_text, nullptr);
+    ASSERT_NE(guarded_text, nullptr);
+    ASSERT_EQ(std::string(namespace_text).find("/servo_delay_demo_"), 0u);
+    const int domain = std::stoi(domain_text);
+    ASSERT_GE(domain, 220);  // Refuse the robot's operational domain (171).
+    ASSERT_LE(domain, 232);
+    const int delay = std::stoi(delay_text);
+    ASSERT_GE(delay, 0);
+    ASSERT_LE(delay, 1500);
+    const bool guarded = std::string(guarded_text) == "1";
+    ASSERT_TRUE(initPeriod("0.02", "", guarded ? "true" : "false"));
+    test::sdk.demo = std::make_unique<test::ServoDelayFakeController>(delay);
+    prepareDiagnosticPublisher(namespace_text, domain);
+    hardware_->createStreamInterfaces();
+    std::mutex commands_mutex;
+    Joints commands{};
+    std::atomic<bool> finished{false};
+    auto subscription = hardware_->_svc_node->create_subscription<std_msgs::msg::Float64MultiArray>(
+        "sim_joint_command", 1, [&](std_msgs::msg::Float64MultiArray::ConstSharedPtr msg) {
+          if (msg->data.size() != 6 || !std::all_of(msg->data.begin(), msg->data.end(),
+              [](double x) { return std::isfinite(x); })) return;
+          std::lock_guard<std::mutex> lock(commands_mutex);
+          std::copy_n(msg->data.begin(), 6, commands.begin());
+        });
+    auto done = hardware_->_svc_node->create_service<std_srvs::srv::Trigger>(
+        "finish_demo", [&](const std::shared_ptr<std_srvs::srv::Trigger::Request>,
+                           std::shared_ptr<std_srvs::srv::Trigger::Response> response) {
+          finished.store(true);
+          response->success = true;
+        });
+    hardware_->startServiceThread();
+    std::ofstream trace(std::string(output) + "/driver_cycles.csv");
+    trace << std::setprecision(12)
+          << "monotonic_s,phase,reason,recoveries,command_j3_rad,measured_j3_rad,servo_calls\n";
+    const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    while (!finished.load() && std::chrono::steady_clock::now() < end) {
+      {
+        std::lock_guard<std::mutex> lock(commands_mutex);
+        setCommand(commands);
+      }
+      writeCycle();
+      const auto state = hardware_->stream_control_;
+      trace << test::ServoDelayFakeController::now() << ',' << static_cast<int>(state.phase)
+            << ',' << static_cast<int>(state.reason) << ',' << static_cast<int>(state.recoveries)
+            << ',' << hardware_->_jnt_position_command[2] << ',' << measured()[2]
+            << ',' << test::sdk.servo_commands.size() << '\n';
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    hardware_->stopServiceThread();
+    test::sdk.demo->save(output);
+    EXPECT_TRUE(finished.load()) << "Python recovery client did not finish within 30 seconds";
+    EXPECT_EQ(test::sdk.reset_calls, 0);
+  }
   void publishDiagnosticSnapshot() { hardware_->publishDiagnostics(); }
   std::string trajectoryStatusTopic() const {
     return hardware_->trajectory_status_sub_->get_topic_name();
@@ -636,6 +698,11 @@ class FairinoHardwareInterfaceTest
   std::unique_ptr<FairinoHardwareInterface> hardware_;
   std::string trace_directory_;
 };
+
+// Opt-in component integration harness, launched only by servo_delay_recovery_demo.py.
+TEST_F(FairinoHardwareInterfaceTest, DISABLED_RosServoDelayRecoveryDemo) {
+  runDelayRecoveryDemo();
+}
 
 TEST_F(FairinoHardwareInterfaceTest, GuardSafetyStopReleaseDoesNotResumeOwnedOldTrajectory) {
   bindStream();
